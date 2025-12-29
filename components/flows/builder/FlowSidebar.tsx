@@ -1,0 +1,101 @@
+
+import React from 'react';
+import { ShieldCheck, History, AlertOctagon, CheckCircle2, ChevronRight, Clock, User } from 'lucide-react';
+import { HistoryLog } from '../../../services/historyService';
+import { ValidationError } from '../../../services/flowValidationService';
+
+interface FlowSidebarProps {
+  validationErrors: ValidationError[];
+  logs: HistoryLog[];
+  onSelectStep: (stepId: string) => void;
+}
+
+const FlowSidebar: React.FC<FlowSidebarProps> = ({ validationErrors, logs, onSelectStep }) => {
+  return (
+    <div className="w-80 h-full border-l border-slate-200 bg-white overflow-hidden flex flex-col shrink-0 shadow-[-10px_0_30px_rgba(0,0,0,0.02)]">
+      <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-8">
+        <div className="space-y-4">
+            <div className="flex items-center justify-between px-1">
+                <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-400 flex items-center gap-2">
+                    <ShieldCheck className="w-4 h-4 text-emerald-500" /> Kiểm duyệt Logic
+                </h4>
+                {validationErrors.length > 0 && (
+                    <span className="bg-rose-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded-md">
+                        {validationErrors.length}
+                    </span>
+                )}
+            </div>
+
+            {validationErrors.length > 0 ? (
+                <div className="space-y-3">
+                    {validationErrors.map((err, i) => (
+                        <button 
+                            key={i} 
+                            onClick={() => err.stepId && onSelectStep(err.stepId)} 
+                            className={`w-full text-left p-4 border rounded-[20px] transition-all group flex gap-3 items-start relative overflow-hidden ${
+                                err.type === 'critical' 
+                                ? 'bg-rose-50/50 border-rose-100 hover:border-rose-300' 
+                                : 'bg-amber-50/50 border-amber-100 hover:border-amber-300'
+                            }`}
+                        >
+                            <div className={`mt-0.5 p-1.5 rounded-lg shrink-0 ${err.type === 'critical' ? 'bg-rose-100 text-rose-600' : 'bg-amber-100 text-amber-600'}`}>
+                                <AlertOctagon className="w-3.5 h-3.5" />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                                <p className={`text-[11px] font-bold leading-relaxed whitespace-normal break-words ${err.type === 'critical' ? 'text-rose-800' : 'text-amber-800'}`}>
+                                    {err.msg}
+                                </p>
+                                {err.stepId && (
+                                    <span className="inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-tighter text-slate-400 mt-2 group-hover:text-[#ca7900] transition-colors">
+                                        Bấm để sửa <ChevronRight className="w-2.5 h-2.5" />
+                                    </span>
+                                )}
+                            </div>
+                            <div className={`absolute left-0 top-0 bottom-0 w-1 ${err.type === 'critical' ? 'bg-rose-500' : 'bg-amber-500'}`}></div>
+                        </button>
+                    ))}
+                </div>
+            ) : (
+                <div className="bg-emerald-50/50 p-6 rounded-[32px] border border-emerald-100/50 flex flex-col items-center text-center group transition-all">
+                    <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-lg shadow-emerald-500/10 mb-4 group-hover:scale-110 transition-transform">
+                        <CheckCircle2 className="w-8 h-8 text-emerald-500" />
+                    </div>
+                    <p className="text-[10px] font-black text-emerald-700 uppercase tracking-widest">Luồng an toàn</p>
+                    <p className="text-[10px] text-emerald-600/60 font-bold mt-1">Sẵn sàng kích hoạt</p>
+                </div>
+            )}
+        </div>
+
+        <div className="pt-8 border-t border-slate-100 space-y-6">
+            <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-400 flex items-center gap-2 px-1">
+                <History className="w-4 h-4 text-[#ffa900]" /> Lịch sử chỉnh sửa
+            </h4>
+            
+            <div className="relative pl-4 space-y-6 before:absolute before:left-[1.5px] before:top-2 before:bottom-2 before:w-0.5 before:bg-slate-50">
+                {logs.length === 0 ? (
+                    <div className="text-center py-10 opacity-30">
+                        <p className="text-[10px] font-bold uppercase tracking-widest">Chưa có nhật ký</p>
+                    </div>
+                ) : logs.map((log) => (
+                    <div key={log.id} className="relative group">
+                        <div className="absolute -left-[18.5px] top-1.5 w-2 h-2 rounded-full bg-white border-2 border-slate-200 group-hover:border-[#ffa900] z-10" />
+                        <div className="bg-slate-50/50 rounded-2xl p-3 border border-transparent hover:border-slate-200 hover:bg-white transition-all">
+                            <div className="flex justify-between items-start mb-1 gap-2">
+                                <p className="text-[11px] font-black text-slate-700 leading-tight flex-1 whitespace-normal break-words">{log.action}</p>
+                                <span className="text-[9px] font-black text-slate-300 uppercase shrink-0 flex items-center gap-1">
+                                    <Clock className="w-2.5 h-2.5" /> 
+                                    {new Date(log.timestamp).toLocaleTimeString('vi-VN', { hour: '2-digit', minute:'2-digit' })}
+                                </span>
+                            </div>
+                            <p className="text-[10px] text-slate-500 font-medium leading-relaxed whitespace-normal break-words">{log.details}</p>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default FlowSidebar;

@@ -1,0 +1,212 @@
+<?php
+// api/forms.php - VERSION V28.1 (ACTIVITY LOGGING WITH FLOW/CAMPAIGN ID)
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+$route = $_GET['route'] ?? '';
+
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    if ($stmtCount->fetchColumn() > 10) {
+        $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1")->execute([$subscriberId]);
+    }
+}
+
+
+try {
+    if ($method === 'POST' && $route === 'submit') {
+        $data = json_decode(file_get_contents("php://input"), true);
+        if (!$data) $data = $_POST;
+
+        $email = trim($data['email'] ?? '');
+        $formId = trim($data['form_id'] ?? '');
+
+        if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            jsonResponse(false, null, 'Email không hợp lệ');
+        }
+
+        $pdo->beginTransaction();
+        
+        $stmtF = $pdo->prepare("SELECT name, target_list_id FROM forms WHERE id = ?");
+        $stmtF->execute([$formId]);
+        $formData = $stmtF->fetch();
+        
+        if (!$formData) {
+            $pdo->rollBack();
+            jsonResponse(false, null, 'Biểu mẫu không tồn tại');
+        }
+
+        $targetListId = $formData['target_list_id'] ?? null;
+        $formName = $formData['name'] ?? 'Form';
+
+        // 1. Xử lý Subscriber (Tạo mới hoặc Update)
+        $stmtCheck = $pdo->prepare("SELECT id, first_name, last_name, phone_number, job_title, company_name, country, city, gender, date_of_birth, anniversary_date, tags FROM subscribers WHERE email = ? LIMIT 1"); // FIX: Select all fields that might be updated
+        $stmtCheck->execute([$email]);
+        $sub = $stmtCheck->fetch();
+
+        $updateSqlParts = [];
+        $updateValues = [];
+        $sid = '';
+
+        // Fields directly from form submission, mapped to DB columns
+        $formFieldsMap = [
+            'firstName' => 'first_name',
+            'lastName' => 'last_name',
+            'phoneNumber' => 'phone_number',
+            'jobTitle' => 'job_title',
+            'companyName' => 'company_name',
+            'country' => 'country',
+            'city' => 'city',
+            'gender' => 'gender',
+            'dateOfBirth' => 'date_of_birth',
+            'anniversaryDate' => 'anniversary_date',
+            'tags' => 'tags', // Will be merged if existing
+        ];
+
+        if ($sub) {
+            $sid = $sub['id'];
+            // Khách cũ quay lại -> Đảm bảo Active
+            $updateSqlParts[] = "status = 'active'";
+            // Update fields if provided and not empty
+            foreach ($formFieldsMap as $dataKey => $dbField) {
+                if (isset($data[$dataKey]) && $data[$dataKey] !== '' && $data[$dataKey] !== null) {
+                    if ($dbField === 'tags') {
+                        // Merge existing tags with new tags
+                        $existingTags = json_decode($sub['tags'] ?? '[]', true);
+                        $newTags = is_array($data[$dataKey]) ? $data[$dataKey] : array_map('trim', explode(',', $data[$dataKey]));
+                        $mergedTags = json_encode(array_unique(array_merge($existingTags, $newTags)));
+                        $updateSqlParts[] = "$dbField = ?";
+                        $updateValues[] = $mergedTags;
+                    } else {
+                        $updateSqlParts[] = "$dbField = ?";
+                        $updateValues[] = $data[$dataKey];
+                    }
+                }
+            }
+            if (!empty($updateSqlParts)) {
+                $pdo->prepare("UPDATE subscribers SET " . implode(', ', $updateSqlParts) . " WHERE id = ?")->execute(array_merge($updateValues, [$sid]));
+            }
+
+        } else {
+            $sid = uniqid();
+            $insertFields = ['id', 'email', 'status', 'source', 'joined_at'];
+            $insertValues = [$sid, $email, 'active', "Form: " . $formName, $now];
+
+            foreach ($formFieldsMap as $dataKey => $dbField) {
+                if (isset($data[$dataKey]) && $data[$dataKey] !== '' && $data[$dataKey] !== null) {
+                    $insertFields[] = $dbField;
+                    if ($dbField === 'tags') {
+                         $newTags = is_array($data[$dataKey]) ? $data[$dataKey] : array_map('trim', explode(',', $data[$dataKey]));
+                         $insertValues[] = json_encode($newTags);
+                    } else {
+                         $insertValues[] = $data[$dataKey];
+                    }
+                }
+            }
+            $placeholders = implode(', ', array_fill(0, count($insertFields), '?'));
+            $fieldNames = implode(', ', $insertFields);
+
+            $pdo->prepare("INSERT INTO subscribers ($fieldNames) VALUES ($placeholders)")
+                ->execute($insertValues);
+        }
+
+        // 3. Ghi danh vào danh sách (Nếu có)
+        if ($targetListId) {
+            $pdo->prepare("INSERT IGNORE INTO subscriber_lists (subscriber_id, list_id) VALUES (?, ?)")->execute([$sid, $targetListId]);
+            $pdo->prepare("UPDATE lists SET subscriber_count = (SELECT COUNT(*) FROM subscriber_lists WHERE list_id = ?) WHERE id = ?")
+                ->execute([$targetListId, $targetListId]);
+        }
+
+        // 4. Ghi log activity (Cho phép nhiều lần submit để track lịch sử)
+        // FIX: Thêm flow_id và campaign_id là null vì đây là trigger form, không phải từ flow/campaign
+        logActivity($pdo, $sid, 'form_submit', $formId, $formName, "Form submitted successfully", null, null); // FIX: Improve details
+
+        $pdo->commit();
+
+        // 5. KÍCH HOẠT WORKER PRIORITY (DIRECT TRIGGER)
+        $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http";
+        $host = $_SERVER['HTTP_HOST'];
+        $dir = dirname($_SERVER['PHP_SELF']);
+        
+        $workerParams = http_build_query([
+            'trigger_type' => 'form',
+            'target_id' => $formId,
+            'subscriber_id' => $sid
+        ]);
+        
+        // Call the new worker_priority.php
+        $workerUrl = "$protocol://$host$dir/worker_priority.php?" . $workerParams;
+        
+        // Non-blocking request to the worker
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $workerUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 1); 
+        curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+        // Add CURLOPT_FOLLOWLOCATION for redirects (e.g., from server config)
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        @curl_exec($ch); // Suppress errors for non-blocking call
+        curl_close($ch);
+
+        jsonResponse(true, ['id' => $sid], 'Đăng ký thành công!');
+    }
+    
+    // --- CÁC METHOD KHÁC (GET/PUT/DELETE) GIỮ NGUYÊN ---
+    switch ($method) {
+        case 'GET':
+            if ($path) {
+                $stmt = $pdo->prepare("SELECT * FROM forms WHERE id = ?");
+                $stmt->execute([$path]);
+                $form = $stmt->fetch();
+                if ($form) {
+                    $form['fields'] = json_decode($form['fields_json'] ?? '[]');
+                    $form['targetListId'] = $form['target_list_id']; // FIX: Add targetListId
+                    $stmtS = $pdo->prepare("SELECT COUNT(*) FROM subscriber_activity WHERE type='form_submit' AND reference_id = ?");
+                    $stmtS->execute([$path]);
+                    $form['stats'] = ['submissions' => (int)$stmtS->fetchColumn()];
+                    unset($form['fields_json'], $form['target_list_id']); // FIX: Unset snake_case keys
+                    jsonResponse(true, $form);
+                } else jsonResponse(false, null, 'Không tìm thấy Form');
+            } else {
+                $stmt = $pdo->query("SELECT f.*, (SELECT COUNT(*) FROM subscriber_activity sa WHERE sa.type = 'form_submit' AND sa.reference_id = f.id) as submission_count FROM forms f ORDER BY f.created_at DESC");
+                $data = array_map(function($f) {
+                    $f['fields'] = json_decode($f['fields_json'] ?? '[]');
+                    $f['targetListId'] = $f['target_list_id'];
+                    $f['stats'] = ['submissions' => (int)($f['submission_count'] ?? 0)];
+                    unset($f['fields_json'], $f['target_list_id'], $f['submission_count']); // FIX: Unset submission_count too
+                    return $f;
+                }, $stmt->fetchAll());
+                jsonResponse(true, $data);
+            }
+            break;
+        case 'POST':
+            $data = json_decode(file_get_contents("php://input"), true);
+            $id = $data['id'] ?? uniqid();
+            $fields = json_encode($data['fields'] ?? []);
+            $pdo->prepare("INSERT INTO forms (id, name, target_list_id, fields_json, created_at) VALUES (?, ?, ?, ?, NOW())")
+                ->execute([$id, $data['name'], $data['targetListId'], $fields]);
+            jsonResponse(true, ['id' => $id]);
+            break;
+        case 'PUT':
+            $data = json_decode(file_get_contents("php://input"), true);
+            $fields = json_encode($data['fields'] ?? []);
+            $pdo->prepare("UPDATE forms SET name = ?, target_list_id = ?, fields_json = ? WHERE id = ?")
+                ->execute([$data['name'], $data['targetListId'], $fields, $path]);
+            jsonResponse(true, $data);
+            break;
+        case 'DELETE':
+            $pdo->prepare("DELETE FROM forms WHERE id = ?")->execute([$path]);
+            jsonResponse(true, ['id' => $path]);
+            break;
+    }
+} catch (Exception $e) {
+    if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+    jsonResponse(false, null, $e->getMessage());
+}
+?>

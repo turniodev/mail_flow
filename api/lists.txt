@@ -1,0 +1,39 @@
+
+<?php
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+
+switch ($method) {
+    case 'GET':
+        $sql = "SELECT id, name, source, subscriber_count as count, DATE_FORMAT(created_at, '%d/%m/%Y') as created FROM lists ORDER BY created_at DESC";
+        $stmt = $pdo->query($sql);
+        jsonResponse(true, $stmt->fetchAll());
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $id = $data['id'] ?? uniqid();
+        $stmt = $pdo->prepare("INSERT INTO lists (id, name, source, subscriber_count, created_at) VALUES (?, ?, ?, ?, NOW())");
+        $stmt->execute([$id, $data['name'], $data['source'], $data['count'] ?? 0]);
+        $data['id'] = $id;
+        jsonResponse(true, $data);
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        $stmt = $pdo->prepare("UPDATE lists SET name = ?, subscriber_count = ? WHERE id = ?");
+        $stmt->execute([$data['name'], $data['count'], $path]);
+        jsonResponse(true, $data);
+        break;
+
+    case 'DELETE':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $pdo->prepare("DELETE FROM lists WHERE id = ?")->execute([$path]);
+        jsonResponse(true, ['id' => $path]);
+        break;
+}
+?>

@@ -1,0 +1,32 @@
+
+
+-- Chạy lệnh này trong MySQL của bạn để cập nhật cấu trúc mới với Collation đồng nhất
+CREATE TABLE IF NOT EXISTS `tags` (
+  `id` CHAR(36) PRIMARY KEY,
+  `name` VARCHAR(100) UNIQUE NOT NULL,
+  `description` TEXT DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `forms` (
+  `id` CHAR(36) PRIMARY KEY,
+  `name` VARCHAR(255) NOT NULL,
+  `target_list_id` CHAR(36),
+  `fields_json` JSON,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `purchase_events` (
+  `id` CHAR(36) PRIMARY KEY,
+  `name` VARCHAR(255) NOT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `custom_events` (
+  `id` CHAR(36) PRIMARY KEY,
+  `name` VARCHAR(255) NOT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Bổ sung cột notes cho subscribers (nếu chưa có)
+ALTER TABLE `subscribers` ADD COLUMN IF NOT EXISTS `notes` JSON DEFAULT '[]' AFTER `anniversary_date`;

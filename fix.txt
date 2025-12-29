@@ -1,0 +1,67 @@
+
+-- 1. Cập nhật cấu trúc bảng subscribers: Bổ sung các cột thiếu
+ALTER TABLE `subscribers` 
+ADD COLUMN IF NOT EXISTS `tags` JSON DEFAULT NULL AFTER `last_name`,
+ADD COLUMN IF NOT EXISTS `source` VARCHAR(100) DEFAULT 'Manual' AFTER `status`,
+ADD COLUMN IF NOT EXISTS `gender` VARCHAR(20) DEFAULT NULL AFTER `last_name`,
+ADD COLUMN IF NOT EXISTS `job_title` VARCHAR(100) DEFAULT NULL AFTER `phone_number`,
+ADD COLUMN IF NOT EXISTS `company_name` VARCHAR(100) DEFAULT NULL AFTER `job_title`,
+ADD COLUMN IF NOT EXISTS `country` VARCHAR(100) DEFAULT NULL AFTER `company_name`,
+ADD COLUMN IF NOT EXISTS `city` VARCHAR(100) DEFAULT NULL AFTER `country`,
+ADD COLUMN IF NOT EXISTS `date_of_birth` DATE DEFAULT NULL,
+ADD COLUMN IF NOT EXISTS `anniversary_date` DATE DEFAULT NULL,
+ADD COLUMN IF NOT EXISTS `stats_sent` INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS `stats_opened` INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS `stats_clicked` INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS `last_open_at` DATETIME DEFAULT NULL,
+ADD COLUMN IF NOT EXISTS `last_click_at` DATETIME DEFAULT NULL;
+
+-- 2. Bổ sung cột thống kê cho Flow (Nếu chưa có)
+ALTER TABLE `flows` 
+ADD COLUMN IF NOT EXISTS `stat_total_sent` INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS `stat_total_opened` INT DEFAULT 0;
+
+-- 3. Bảng quản lý trạng thái khách hàng trong từng Flow
+CREATE TABLE IF NOT EXISTS `subscriber_flow_states` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `subscriber_id` CHAR(36) NOT NULL,
+  `flow_id` CHAR(36) NOT NULL,
+  `step_id` CHAR(36) NOT NULL,
+  `status` ENUM('waiting', 'processing', 'completed', 'failed') DEFAULT 'waiting',
+  `scheduled_at` DATETIME NOT NULL,
+  `last_error` TEXT,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX `idx_scheduled` (`scheduled_at`),
+  INDEX `idx_subscriber_flow` (`subscriber_id`, `flow_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 4. Bảng Settings
+CREATE TABLE IF NOT EXISTS `system_settings` (
+  `key` VARCHAR(50) PRIMARY KEY,
+  `value` TEXT,
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 5. Bảng Lịch sử Hành trình Khách hàng (Activity Log)
+CREATE TABLE IF NOT EXISTS `subscriber_activity` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `subscriber_id` CHAR(36) NOT NULL,
+  `type` VARCHAR(50) NOT NULL, -- 'open_email', 'click_link', 'join_list', 'enter_segment', 'enter_flow'
+  `reference_id` CHAR(36) DEFAULT NULL, -- CampaignID, ListID, SegmentID, FlowID
+  `reference_name` VARCHAR(255) DEFAULT NULL, -- Tên chiến dịch/list để hiển thị nhanh
+  `details` VARCHAR(255) DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_sub_history` (`subscriber_id`, `created_at`),
+  INDEX `idx_unique_check` (`subscriber_id`, `type`, `reference_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 6. Bảng Nhật ký gửi mail
+CREATE TABLE IF NOT EXISTS `mail_delivery_logs` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `recipient` VARCHAR(255) NOT NULL,
+  `subject` VARCHAR(255),
+  `status` ENUM('success', 'failed') DEFAULT 'success',
+  `error_message` TEXT,
+  `sent_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

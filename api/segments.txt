@@ -1,0 +1,43 @@
+
+<?php
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+
+switch ($method) {
+    case 'GET':
+        $stmt = $pdo->query("SELECT id, name, description, criteria, subscriber_count as count, auto_cleanup_days as autoCleanupDays FROM segments");
+        jsonResponse(true, $stmt->fetchAll());
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $id = $data['id'] ?? uniqid();
+        // Criteria is stored as JSON string in DB
+        $criteria = is_string($data['criteria']) ? $data['criteria'] : json_encode($data['criteria']);
+        
+        $stmt = $pdo->prepare("INSERT INTO segments (id, name, description, criteria, subscriber_count, auto_cleanup_days) VALUES (?, ?, ?, ?, ?, ?)");
+        $stmt->execute([$id, $data['name'], $data['description'], $criteria, $data['count'], $data['autoCleanupDays']]);
+        $data['id'] = $id;
+        jsonResponse(true, $data);
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        $criteria = is_string($data['criteria']) ? $data['criteria'] : json_encode($data['criteria']);
+        
+        $stmt = $pdo->prepare("UPDATE segments SET name=?, description=?, criteria=?, subscriber_count=?, auto_cleanup_days=? WHERE id=?");
+        $stmt->execute([$data['name'], $data['description'], $criteria, $data['count'], $data['autoCleanupDays'], $path]);
+        jsonResponse(true, $data);
+        break;
+
+    case 'DELETE':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $pdo->prepare("DELETE FROM segments WHERE id = ?")->execute([$path]);
+        jsonResponse(true, ['id' => $path]);
+        break;
+}
+?>

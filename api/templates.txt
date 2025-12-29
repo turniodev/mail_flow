@@ -1,0 +1,65 @@
+
+<?php
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+
+function formatTemplate($row) {
+    $row['blocks'] = json_decode($row['blocks'] ?? '[]');
+    $row['bodyStyle'] = json_decode($row['body_style'] ?? '{}');
+    $row['htmlContent'] = $row['html_content'];
+    $row['lastModified'] = $row['updated_at'];
+    unset($row['body_style'], $row['html_content'], $row['updated_at']);
+    return $row;
+}
+
+switch ($method) {
+    case 'GET':
+        if ($path) {
+            $stmt = $pdo->prepare("SELECT * FROM templates WHERE id = ?");
+            $stmt->execute([$path]);
+            $tpl = $stmt->fetch();
+            $tpl ? jsonResponse(true, formatTemplate($tpl)) : jsonResponse(false, null, 'Not found');
+        } else {
+            $stmt = $pdo->query("SELECT * FROM templates ORDER BY updated_at DESC");
+            $tpls = $stmt->fetchAll();
+            jsonResponse(true, array_map('formatTemplate', $tpls));
+        }
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $id = $data['id'] ?? uniqid();
+        $blocks = json_encode($data['blocks'] ?? []);
+        $style = json_encode($data['bodyStyle'] ?? (object)[]);
+        
+        $sql = "INSERT INTO templates (id, name, thumbnail, category, blocks, body_style, html_content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$id, $data['name'], $data['thumbnail'], $data['category'], $blocks, $style, $data['htmlContent']]);
+        
+        $data['id'] = $id;
+        jsonResponse(true, $data);
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        $blocks = json_encode($data['blocks'] ?? []);
+        $style = json_encode($data['bodyStyle'] ?? (object)[]);
+        
+        $sql = "UPDATE templates SET name=?, thumbnail=?, category=?, blocks=?, body_style=?, html_content=?, updated_at=NOW() WHERE id=?";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$data['name'], $data['thumbnail'], $data['category'], $blocks, $style, $data['htmlContent'], $path]);
+        
+        jsonResponse(true, $data);
+        break;
+
+    case 'DELETE':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $pdo->prepare("DELETE FROM templates WHERE id = ?")->execute([$path]);
+        jsonResponse(true, ['id' => $path]);
+        break;
+}
+?>

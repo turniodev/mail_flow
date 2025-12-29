@@ -1,0 +1,249 @@
+<?php
+// api/worker_enroll.php - OMNI-ENGINE V28.1 (STANDARD ENROLLMENT & SEGMENT SYNC WITH FLOW/CAMPAIGN ID LOGGING)
+// This worker is designed to be run by a cron job (e.g., once daily or hourly)
+// to handle standard flow triggers like segment entry, date-based events, etc.
+// It also performs auto-sync for dynamic segments.
+
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE); 
+ini_set('display_errors', 0);
+set_time_limit(300); // Allow up to 5 minutes for segment sync and enrollment
+
+require_once 'db_connect.php';
+// No Mailer needed as this worker only enrolls, not sends.
+
+date_default_timezone_set('Asia/Ho_Chi_Minh');
+$pdo->exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
+
+$now = date('Y-m-d H:i:s');
+$todayMD = date('m-d'); 
+$logs = [];
+$logs[] = "--- ENROLLMENT WORKER START: $now ---";
+
+// =================================================================================
+// HELPER: Log Activity with Limit (Replicated for self-sufficiency)
+// =================================================================================
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    $count = $stmtCount->fetchColumn();
+
+    if ($count > 10) {
+        $stmtDel = $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1");
+        $stmtDel->execute([$subscriberId]);
+    }
+}
+
+// =================================================================================
+// HELPER: isSubscriberMatch (Replicated for self-sufficiency)
+// =================================================================================
+function isSubscriberMatch($sub, $criteriaJson) {
+    if (empty($criteriaJson)) return true;
+    $groups = json_decode($criteriaJson, true);
+    if (!$groups || !is_array($groups)) return false;
+    foreach ($groups as $group) {
+        $groupMatch = true;
+        if (!isset($group['conditions']) || !is_array($group['conditions'])) continue;
+        
+        foreach ($group['conditions'] as $cond) {
+            $field = $cond['field']; $op = $cond['operator']; $val = strtolower($cond['value'] ?? '');
+            $actualVal = "";
+            
+            if (strpos($field, 'stats.') === 0) {
+                $statKey = str_replace('stats.', '', $field);
+                if ($statKey == 'emailsOpened') $actualVal = $sub['stats_opened'] ?? 0;
+                else if ($statKey == 'linksClicked') $actualVal = $sub['stats_clicked'] ?? 0;
+            } else if ($field === 'tags') {
+                // Ensure tags are always treated as an array for comparison
+                $subTags = json_decode($sub['tags'] ?? '[]', true);
+                if (!is_array($subTags)) $subTags = [];
+                
+                $isMatch = false;
+                if ($op === 'contains') {
+                    $isMatch = in_array(strtolower($val), array_map('strtolower', $subTags));
+                } else if ($op === 'not_contains') {
+                    $isMatch = !in_array(strtolower($val), array_map('strtolower', $subTags));
+                }
+                if (!$isMatch) { $groupMatch = false; break; }
+                continue; // Skip rest of switch for tags
+            } else { 
+                $actualVal = $sub[$field] ?? ""; 
+            }
+            
+            $actualVal = (string)$actualVal;
+            $isMatch = false;
+
+            switch ($op) {
+                case 'contains': 
+                    if (strpos(strtolower($actualVal), $val) !== false) $isMatch = true; 
+                    break;
+                case 'not_contains': 
+                    if (strpos(strtolower($actualVal), $val) === false) $isMatch = true; 
+                    break;
+                case 'equals': case 'is': 
+                    if (strtolower($actualVal) == $val) $isMatch = true; 
+                    break;
+                case 'is_not': 
+                    if (strtolower($actualVal) != $val) $isMatch = true; 
+                    break;
+                case 'starts_with': 
+                    if (substr(strtolower($actualVal), 0, strlen($val)) === $val) $isMatch = true; 
+                    break;
+                case 'greater_than': 
+                    if ((float)$actualVal > (float)$val) $isMatch = true; 
+                    break;
+                case 'less_than': 
+                    if ((float)$actualVal < (float)$val) $isMatch = true; 
+                    break;
+                case 'after': 
+                    if (strtotime($actualVal) > strtotime($val)) $isMatch = true; 
+                    break;
+                case 'before': 
+                    if (strtotime($actualVal) < strtotime($val)) $isMatch = true; 
+                    break;
+                case 'on': // New operator for exact date match
+                    if (date('Y-m-d', strtotime($actualVal)) === $val) $isMatch = true;
+                    break;
+            }
+            
+            if (!$isMatch) { $groupMatch = false; break; }
+        }
+        if ($groupMatch) return true; // Satisfy any Group (OR) is a match
+    }
+    return false;
+}
+
+// =================================================================================
+// SEGMENT AUTO-SYNC
+// =================================================================================
+$logs[] = "[Segment] Syncing membership counts...";
+$stmtSegs = $pdo->query("SELECT id, criteria FROM segments");
+$allSegments = $stmtSegs->fetchAll();
+$stmtSubs = $pdo->query("SELECT id, status, tags, joined_at, date_of_birth, anniversary_date, stats_opened, stats_clicked, last_open_at, last_click_at FROM subscribers");
+$allSubscribers = $stmtSubs->fetchAll();
+
+foreach ($allSegments as $seg) {
+    $matchCount = 0;
+    foreach ($allSubscribers as $sub) {
+        if (isSubscriberMatch($sub, $seg['criteria'])) {
+            $matchCount++;
+        }
+    }
+    $pdo->prepare("UPDATE segments SET subscriber_count = ? WHERE id = ?")->execute([$matchCount, $seg['id']]);
+    $logs[] = "  - Segment '{$seg['id']}' updated to {$matchCount} members.";
+}
+$logs[] = "[Segment] Sync completed.";
+
+
+// =================================================================================
+// STANDARD FLOW ENROLLMENT
+// =================================================================================
+$logs[] = "[Enrollment] Checking active flows for new enrollments...";
+$stmtActiveFlows = $pdo->query("SELECT id, name, steps FROM flows WHERE status = 'active'");
+$activeFlows = $stmtActiveFlows->fetchAll();
+
+foreach ($activeFlows as $flow) {
+    $steps = json_decode($flow['steps'], true); 
+    $trigger = null; 
+    foreach($steps as $s) if($s['type'] === 'trigger') $trigger = $s;
+    if (!$trigger || !isset($trigger['nextStepId'])) continue;
+
+    $tConfig = $trigger['config']; 
+    $tType = $tConfig['type'] ?? 'segment';
+    
+    // This worker handles Segment and Date triggers. Other types are handled by priority/campaign workers.
+    if (!in_array($tType, ['segment', 'date'])) continue;
+
+    $eligibleSubscriberIds = [];
+    $enrollmentCriteria = [];
+
+    if ($tType === 'segment') {
+        $stmtSeg = $pdo->prepare("SELECT criteria FROM segments WHERE id = ?"); 
+        $stmtSeg->execute([$tConfig['targetId']]);
+        $segDef = $stmtSeg->fetch();
+        if ($segDef) {
+            $enrollmentCriteria = $segDef['criteria'];
+            foreach ($allSubscribers as $sub) { // Use already fetched subscribers
+                if ($sub['status'] === 'active' && isSubscriberMatch($sub, $enrollmentCriteria)) { // Only active subscribers
+                    $eligibleSubscriberIds[] = $sub['id'];
+                }
+            }
+        } else {
+            $logs[] = "  - Flow '{$flow['name']}': Trigger segment '{$tConfig['targetId']}' not found. Skipping.";
+            continue;
+        }
+    } else if ($tType === 'date') {
+        $field = $tConfig['dateField'] ?? 'dateOfBirth';
+        if ($field === 'lastActivity') {
+            $days = (int)($tConfig['inactiveAmount'] ?? 30);
+            $inactiveThreshold = date('Y-m-d H:i:s', strtotime("-{$days} days"));
+
+            foreach ($allSubscribers as $sub) {
+                // Ensure joined_at is also older than the inactivity threshold
+                if ($sub['status'] === 'active' && 
+                    (empty($sub['last_open_at']) || $sub['last_open_at'] < $inactiveThreshold) &&
+                    (empty($sub['last_click_at']) || $sub['last_click_at'] < $inactiveThreshold) &&
+                    (empty($sub['joined_at']) || $sub['joined_at'] < $inactiveThreshold)
+                ) {
+                    $eligibleSubscriberIds[] = $sub['id'];
+                }
+            }
+        } else { // dateOfBirth or anniversaryDate
+            $dbField = ($field === 'anniversaryDate') ? 'anniversary_date' : 'date_of_birth';
+            foreach ($allSubscribers as $sub) {
+                if ($sub['status'] === 'active' && !empty($sub[$dbField]) && date('m-d', strtotime($sub[$dbField])) === $todayMD) {
+                    $eligibleSubscriberIds[] = $sub['id'];
+                }
+            }
+        }
+    }
+
+    if (count($eligibleSubscriberIds) > 0) {
+        $placeholders = implode(',', array_fill(0, count($eligibleSubscriberIds), '?'));
+        $sqlCheckExisting = "SELECT subscriber_id FROM subscriber_flow_states WHERE flow_id = ? AND subscriber_id IN ({$placeholders}) AND status IN ('waiting', 'processing')";
+        $stmtCheckExisting = $pdo->prepare($sqlCheckExisting); 
+        // FIX: Use array_merge to pass parameters correctly without PHP 7.4 spread operator
+        $executeParams = array_merge([$flow['id']], $eligibleSubscriberIds);
+        $stmtCheckExisting->execute($executeParams);
+        
+        $existingEnrollments = array_column($stmtCheckExisting->fetchAll(), 'subscriber_id');
+        
+        $newEnrollments = array_diff($eligibleSubscriberIds, $existingEnrollments);
+
+        if (!empty($newEnrollments)) {
+            $stmtE = $pdo->prepare("INSERT INTO subscriber_flow_states (subscriber_id, flow_id, step_id, scheduled_at, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'waiting', NOW(), NOW())"); // FIX: Added updated_at
+            foreach ($newEnrollments as $subId) { 
+                $pastTime = date('Y-m-d H:i:s', strtotime('-1 second')); // Schedule immediately for the next worker_flow run
+                $stmtE->execute([$subId, $flow['id'], $trigger['nextStepId'], $pastTime]); 
+                
+                // FIX: Cải thiện details cho log enter_flow
+                $detailMessage = "Automatic Trigger: {$tType}";
+                if ($tType === 'segment') {
+                    $stmtSegName = $pdo->prepare("SELECT name FROM segments WHERE id = ?");
+                    $stmtSegName->execute([$tConfig['targetId']]);
+                    $segmentName = $stmtSegName->fetchColumn();
+                    $detailMessage .= " (Segment: '" . ($segmentName ?: $tConfig['targetId']) . "')";
+                } elseif ($tType === 'date') {
+                    $detailMessage .= " (Date Event: {$tConfig['dateField']})";
+                    if (isset($tConfig['inactiveAmount'])) {
+                        $detailMessage .= " for {$tConfig['inactiveAmount']} days inactive";
+                    }
+                }
+                logActivity($pdo, $subId, 'enter_flow', $flow['id'], $flow['name'], $detailMessage, $flow['id']); // FIX: Pass flow_id
+            }
+            $pdo->prepare("UPDATE flows SET stat_enrolled = stat_enrolled + ? WHERE id = ?")->execute([count($newEnrollments), $flow['id']]);
+            $logs[] = "  - Enrolled " . count($newEnrollments) . " subscribers into Flow '{$flow['name']}' ({$tType} trigger).";
+        } else {
+             $logs[] = "  - No new subscribers eligible for Flow '{$flow['name']}' ({$tType} trigger). (All existing or already in queue)";
+        }
+    } else {
+         $logs[] = "  - No subscribers eligible for Flow '{$flow['name']}' ({$tType} trigger).";
+    }
+}
+$logs[] = "[Enrollment] Enrollment check completed.";
+
+echo implode("\n", $logs);
+?>

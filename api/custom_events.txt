@@ -1,0 +1,180 @@
+<?php
+// api/custom_events.php - VERSION V28.1 (ACTIVITY LOGGING WITH FLOW/CAMPAIGN ID)
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+$route = $_GET['route'] ?? '';
+
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    if ($stmtCount->fetchColumn() > 10) {
+        $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1")->execute([$subscriberId]);
+    }
+}
+
+
+try {
+    // --- TRACKING CUSTOM EVENT (PUBLIC API) ---
+    if ($method === 'POST' && $route === 'track') {
+        $data = json_decode(file_get_contents("php://input"), true);
+        
+        $email = trim($data['email'] ?? '');
+        $eventId = trim($data['event_id'] ?? '');
+        $properties = $data['properties'] ?? []; // Arbitrary data
+
+        if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) jsonResponse(false, null, 'Email không hợp lệ');
+        if (!$eventId) jsonResponse(false, null, 'Thiếu Event ID');
+
+        $pdo->beginTransaction();
+
+        // 1. Verify Event
+        $stmtEvt = $pdo->prepare("SELECT name FROM custom_events WHERE id = ?");
+        $stmtEvt->execute([$eventId]);
+        $eventName = $stmtEvt->fetchColumn();
+        if (!$eventName) {
+            $pdo->rollBack();
+            jsonResponse(false, null, 'Sự kiện không tồn tại');
+        }
+
+        // 2. Upsert Subscriber
+        $stmtCheck = $pdo->prepare("SELECT id FROM subscribers WHERE email = ? LIMIT 1");
+        $stmtCheck->execute([$email]);
+        $sub = $stmtCheck->fetch();
+
+        $updateSqlParts = [];
+        $updateValues = [];
+        $sid = '';
+
+        // Fields from data, mapped to DB columns
+        $subscriberFieldsMap = [
+            'firstName' => 'first_name',
+            'lastName' => 'last_name',
+            // Add other relevant fields if necessary
+        ];
+
+
+        if ($sub) {
+            $sid = $sub['id'];
+            $updateSqlParts[] = "status = 'active'"; // Ensure active status
+            
+            // Update other subscriber fields if provided
+            foreach ($subscriberFieldsMap as $dataKey => $dbField) {
+                if (isset($data[$dataKey]) && $data[$dataKey] !== '' && $data[$dataKey] !== null) {
+                    $updateSqlParts[] = "$dbField = ?";
+                    $updateValues[] = $data[$dataKey];
+                }
+            }
+
+            if (!empty($updateSqlParts)) {
+                $pdo->prepare("UPDATE subscribers SET " . implode(', ', $updateSqlParts) . " WHERE id = ?")->execute(array_merge($updateValues, [$sid]));
+            }
+        } else {
+            $sid = uniqid();
+            $insertFields = ['id', 'email', 'status', 'source', 'joined_at'];
+            $insertValues = [$sid, $email, 'active', "Custom Event: " . $eventName, $now];
+
+            // Add provided subscriber info to insert statement
+            foreach ($subscriberFieldsMap as $dataKey => $dbField) {
+                if (isset($data[$dataKey]) && $data[$dataKey] !== '' && $data[$dataKey] !== null) {
+                    $insertFields[] = $dbField;
+                    $insertValues[] = $data[$dataKey];
+                }
+            }
+            $placeholders = implode(', ', array_fill(0, count($insertFields), '?'));
+            $fieldNames = implode(', ', $insertFields);
+
+            $pdo->prepare("INSERT INTO subscribers ($fieldNames) VALUES ($placeholders)")
+                ->execute($insertValues);
+        }
+
+        // 3. Log Activity
+        $details = "Triggered Custom Event: {$eventName}";
+        if (!empty($properties)) {
+            $details .= " (Props: " . json_encode($properties, JSON_UNESCAPED_UNICODE) . ")";
+        }
+
+        // FIX: Thêm flow_id và campaign_id là null vì đây là trigger custom_event, không phải từ flow/campaign
+        logActivity($pdo, $sid, 'custom_event', $eventId, $eventName, $details, null, null); // FIX: Improve details
+
+        $pdo->commit();
+
+        // 4. Trigger Worker PRIORITY
+        $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http";
+        $host = $_SERVER['HTTP_HOST'];
+        $dir = dirname($_SERVER['PHP_SELF']);
+        
+        $workerParams = http_build_query([
+            'trigger_type' => 'custom_event',
+            'target_id' => $eventId,
+            'subscriber_id' => $sid
+        ]);
+        
+        // Call the new worker_priority.php
+        $workerUrl = "$protocol://$host$dir/worker_priority.php?" . $workerParams;
+        
+        // Non-blocking request to the worker
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $workerUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 1); 
+        curl_setopt($ch, CURLOPT_NOSIGNAL, 1);
+        // Add CURLOPT_FOLLOWLOCATION for redirects (e.g., from server config)
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        @curl_exec($ch); // Suppress errors for non-blocking call
+        curl_close($ch);
+
+        jsonResponse(true, ['id' => $sid], 'Ghi nhận sự kiện thành công');
+    }
+
+    // --- CRUD ---
+    switch ($method) {
+        case 'GET':
+            $stmt = $pdo->query("SELECT c.*, 
+                                (SELECT COUNT(*) FROM subscriber_activity sa WHERE sa.type = 'custom_event' AND sa.reference_id = c.id) as count
+                                FROM custom_events c ORDER BY c.created_at DESC");
+            $data = array_map(function($row) {
+                return [
+                    'id' => $row['id'],
+                    'name' => $row['name'],
+                    'createdAt' => $row['created_at'],
+                    'stats' => [
+                        'count' => (int)$row['count']
+                    ]
+                ];
+            }, $stmt->fetchAll());
+            jsonResponse(true, $data);
+            break;
+
+        case 'POST':
+            $data = json_decode(file_get_contents("php://input"), true);
+            $id = uniqid();
+            $pdo->prepare("INSERT INTO custom_events (id, name, created_at) VALUES (?, ?, NOW())")
+                ->execute([$id, $data['name']]);
+            jsonResponse(true, ['id' => $id]);
+            break;
+
+        case 'PUT':
+            if (!$path) jsonResponse(false, null, 'ID required');
+            $data = json_decode(file_get_contents("php://input"), true);
+            $pdo->prepare("UPDATE custom_events SET name = ? WHERE id = ?")->execute([$data['name'], $path]);
+            jsonResponse(true, $data);
+            break;
+
+        case 'DELETE':
+            if (!$path) jsonResponse(false, null, 'ID required');
+            $pdo->prepare("DELETE FROM custom_events WHERE id = ?")->execute([$path]);
+            jsonResponse(true, ['id' => $path]);
+            break;
+    }
+
+} catch (Exception $e) {
+    if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+    jsonResponse(false, null, $e->getMessage());
+}
+?>

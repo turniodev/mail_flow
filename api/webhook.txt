@@ -1,0 +1,121 @@
+<?php
+// api/webhook.php - TRACKING CORE V26.1 (DEBUG LOGGER MODE & FLOW/CAMPAIGN ID LOGGING)
+// File này xử lý tracking Open/Click. Nó sẽ tự động ghi log vào 'webhook_debug.log' để bạn kiểm tra.
+
+// 1. CHỐNG CACHE TRÌNH DUYỆT (BẮT BUỘC)
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+
+// 2. GHI LOG DEBUG (QUAN TRỌNG ĐỂ BIẾT GMAIL CÓ GỌI VỀ KHÔNG)
+$logFile = __DIR__ . '/webhook_debug.log';
+$logEntry = date('Y-m-d H:i:s') . " | IP: " . $_SERVER['REMOTE_ADDR'] . " | URI: " . $_SERVER['REQUEST_URI'] . "\n";
+file_put_contents($logFile, $logEntry, FILE_APPEND);
+
+require_once 'db_connect.php';
+
+$type = $_GET['type'] ?? ''; 
+$cid = $_GET['cid'] ?? null; 
+$fid = $_GET['fid'] ?? null; 
+$sid = $_GET['sid'] ?? null; 
+$urlEncoded = $_GET['url'] ?? '';
+$flowName = $_GET['fn'] ?? ''; 
+
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    // Insert new activity
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+
+    // Delete oldest activities if count exceeds 10
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    $count = $stmtCount->fetchColumn();
+
+    if ($count > 10) {
+        $stmtDel = $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1");
+        $stmtDel->execute([$subscriberId]);
+    }
+}
+
+
+try {
+    if ($sid) {
+        $targetRefId = !empty($fid) ? $fid : (!empty($cid) ? $cid : 'direct'); // This is the ID for the main reference_id column
+        $refLabel = !empty($flowName) ? "Flow: $flowName" : (!empty($fid) ? "Automation Flow" : (!empty($cid) ? "Email Campaign" : "Direct Message"));
+
+        // --- XỬ LÝ OPEN ---
+        if ($type === 'open') {
+            // Kiểm tra subscriber có tồn tại không để tránh lỗi FK
+            $checkSub = $pdo->prepare("SELECT id FROM subscribers WHERE id = ?");
+            $checkSub->execute([$sid]);
+            
+            if ($checkSub->fetch()) {
+                // Ghi Activity, truyền thêm $fid và $cid
+                logActivity($pdo, $sid, 'open_email', $targetRefId, $refLabel, 'Customer opened email', $fid, $cid); // FIX: Improve details
+                
+                // Update Subscriber Stats
+                $pdo->prepare("UPDATE subscribers SET stats_opened = stats_opened + 1, last_open_at = NOW() WHERE id = ?")->execute([$sid]);
+                
+                // Update Campaign Stats
+                if (!empty($cid)) {
+                    $pdo->prepare("UPDATE campaigns SET count_opened = count_opened + 1 WHERE id = ?")->execute([$cid]);
+                }
+                
+                // Update Flow Stats
+                if (!empty($fid)) {
+                    $pdo->prepare("UPDATE flows SET stat_total_opened = stat_total_opened + 1 WHERE id = ?")->execute([$fid]);
+                }
+                
+                file_put_contents($logFile, "  -> [SUCCESS] Open recorded for Subscriber $sid\n", FILE_APPEND);
+            } else {
+                file_put_contents($logFile, "  -> [ERROR] Subscriber $sid not found in DB\n", FILE_APPEND);
+            }
+
+            // Trả về ảnh GIF 1x1
+            header('Content-Type: image/gif');
+            echo base64_decode('R0lGODlhAQABAJAAAP8AAAAAACH5BAUQAAAALAAAAAABAAEAAAICBAEAOw==');
+            exit;
+        }
+
+        // --- XỬ LÝ CLICK ---
+        if ($type === 'click') {
+            $targetUrl = base64_decode($urlEncoded);
+            file_put_contents($logFile, "  -> [CLICK] Target: $targetUrl\n", FILE_APPEND);
+
+            // Ghi Activity, truyền thêm $fid và $cid
+            logActivity($pdo, $sid, 'click_link', $targetRefId, $refLabel, "Clicked link: $targetUrl", $fid, $cid); // FIX: Improve details
+            
+            $pdo->prepare("UPDATE subscribers SET stats_clicked = stats_clicked + 1, last_click_at = NOW() WHERE id = ?")->execute([$sid]);
+            
+            if (!empty($fid)) $pdo->prepare("UPDATE flows SET stat_click_rate = stat_click_rate + 1 WHERE id = ?")->execute([$fid]);
+            if (!empty($cid)) $pdo->prepare("UPDATE campaigns SET count_clicked = count_clicked + 1 WHERE id = ?")->execute([$cid]);
+            
+            if ($targetUrl) { header("Location: $targetUrl"); exit; }
+        }
+
+        // --- XỬ LÝ UNSUBSCRIBE ---
+        if ($type === 'unsubscribe') {
+            $pdo->prepare("UPDATE subscribers SET status = 'unsubscribed' WHERE id = ?")->execute([$sid]);
+            // Ghi Activity, truyền thêm $fid và $cid
+            logActivity($pdo, $sid, 'unsubscribe', $targetRefId, $refLabel, 'Customer unsubscribed', $fid, $cid); // FIX: Improve details
+            
+            echo "<div style='font-family:sans-serif; text-align:center; padding:50px;'><h1>Đã hủy đăng ký thành công</h1><p>Bạn sẽ không nhận được email từ chúng tôi nữa.</p></div>"; 
+            exit;
+        }
+    }
+} catch (Exception $e) {
+    // Nếu có lỗi, ghi vào log file nhưng VẪN TRẢ VỀ ẢNH để không bị hiện icon ảnh lỗi bên phía người dùng
+    file_put_contents($logFile, "  -> [EXCEPTION] " . $e->getMessage() . "\n", FILE_APPEND);
+    
+    if ($type === 'open') {
+        header('Content-Type: image/gif');
+        echo base64_decode('R0lGODlhAQABAJAAAP8AAAAAACH5BAUQAAAALAAAAAABAAEAAAICBAEAOw==');
+        exit;
+    }
+}
+
+// Fallback mặc định
+header('Content-Type: image/gif');
+echo base64_decode('R0lGODlhAQABAJAAAP8AAAAAACH5BAUQAAAALAAAAAABAAEAAAICBAEAOw==');
+?>

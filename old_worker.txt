@@ -1,0 +1,299 @@
+<?php
+// api/worker.php - OMNI-ENGINE V13.0 (DYNAMIC SEGMENT AUTO-SYNC & FLOW EXIT LOGIC)
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE); 
+ini_set('display_errors', 0);
+set_time_limit(0); 
+
+require_once 'db_connect.php';
+require_once 'Mailer.php';
+
+date_default_timezone_set('Asia/Ho_Chi_Minh');
+$pdo->exec("SET time_zone = '+07:00'");
+
+// Lấy tham số cấu hình
+$checkOnly = isset($_GET['check_birthday']) && $_GET['check_birthday'] == '1';
+
+$apiUrl = "https://ka-en.com.vn/mail_api"; 
+$stmt = $pdo->query("SELECT * FROM system_settings");
+$settings = [];
+foreach ($stmt->fetchAll() as $row) { $settings[$row['key']] = $row['value']; }
+$defaultSender = !empty($settings['smtp_user']) ? $settings['smtp_user'] : "marketing@ka-en.com.vn"; 
+$mailer = new Mailer($pdo, $apiUrl, $defaultSender);
+
+$now = date('Y-m-d H:i:s');
+$todayMD = date('m-d'); 
+$currentTime = date('H:i');
+$currentDayIdx = (date('w') == 0) ? 6 : date('w') - 1; 
+
+$logs = [];
+$logs[] = "--- ENGINE V13.0 RUN: $now ---";
+
+// --- HÀM TRỢ LÝ (HELPERS) ---
+
+function isSubscriberMatch($sub, $criteriaJson) {
+    if (empty($criteriaJson)) return true;
+    $groups = json_decode($criteriaJson, true);
+    if (!$groups || !is_array($groups)) return false;
+    foreach ($groups as $group) {
+        $groupMatch = true;
+        if (!isset($group['conditions']) || !is_array($group['conditions'])) continue;
+        
+        foreach ($group['conditions'] as $cond) {
+            $field = $cond['field']; $op = $cond['operator']; $val = strtolower($cond['value'] ?? '');
+            $actualVal = "";
+            
+            if (strpos($field, 'stats.') === 0) {
+                $statKey = str_replace('stats.', '', $field);
+                if ($statKey == 'emailsOpened') $actualVal = $sub['stats_opened'] ?? 0;
+                else if ($statKey == 'linksClicked') $actualVal = $sub['stats_clicked'] ?? 0;
+            } else if ($field === 'tags') {
+                $actualVal = $sub['tags'] ?? '[]'; // JSON string hoặc array
+            } else { 
+                $actualVal = $sub[$field] ?? ""; 
+            }
+            
+            $actualVal = (string)$actualVal;
+            $isMatch = false;
+
+            switch ($op) {
+                case 'contains': 
+                    if (strpos(strtolower($actualVal), $val) !== false) $isMatch = true; 
+                    break;
+                case 'not_contains': 
+                    if (strpos(strtolower($actualVal), $val) === false) $isMatch = true; 
+                    break;
+                case 'equals': case 'is': 
+                    if (strtolower($actualVal) == $val) $isMatch = true; 
+                    break;
+                case 'is_not': 
+                    if (strtolower($actualVal) != $val) $isMatch = true; 
+                    break;
+                case 'starts_with': 
+                    if (substr(strtolower($actualVal), 0, strlen($val)) === $val) $isMatch = true; 
+                    break;
+                case 'greater_than': 
+                    if ((float)$actualVal > (float)$val) $isMatch = true; 
+                    break;
+                case 'less_than': 
+                    if ((float)$actualVal < (float)$val) $isMatch = true; 
+                    break;
+                case 'after': 
+                    if (strtotime($actualVal) > strtotime($val)) $isMatch = true; 
+                    break;
+                case 'before': 
+                    if (strtotime($actualVal) < strtotime($val)) $isMatch = true; 
+                    break;
+            }
+            
+            if (!$isMatch) { $groupMatch = false; break; }
+        }
+        if ($groupMatch) return true; // Thỏa mãn bất kỳ Group (OR) nào là đạt
+    }
+    return false;
+}
+
+// --- PHẦN 1: IMAP POLLING (CHECK REPLY) ---
+if (!$checkOnly && isset($settings['imap_enabled']) && $settings['imap_enabled'] === '1' && function_exists('imap_open')) {
+    $imapHost = '{' . $settings['imap_host'] . ':' . $settings['imap_port'] . '/imap/ssl}INBOX';
+    $imapUser = $settings['imap_user'];
+    $imapPass = $settings['imap_pass'];
+    $inbox = @imap_open($imapHost, $imapUser, $imapPass);
+    if ($inbox) {
+        $emails = imap_search($inbox, 'UNSEEN');
+        if ($emails) {
+            foreach ($emails as $email_number) {
+                $header = imap_headerinfo($inbox, $email_number);
+                $fromEmail = $header->from[0]->mailbox . "@" . $header->from[0]->host;
+                $stmtSub = $pdo->prepare("SELECT id FROM subscribers WHERE email = ? LIMIT 1");
+                $stmtSub->execute([$fromEmail]);
+                $sub = $stmtSub->fetch();
+                if ($sub) {
+                    $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, reference_name, details, created_at) VALUES (?, 'reply_email', 'inbox', 'IMAP Reply', ?, NOW())")
+                        ->execute([$sub['id'], "Subject: " . imap_utf8($header->subject)]);
+                }
+            }
+        }
+        imap_close($inbox);
+    }
+}
+
+// --- PHẦN 2: TỰ ĐỘNG CẬP NHẬT SĨ SỐ PHÂN KHÚC (SEGMENT AUTO-SYNC) ---
+// Logic: Quét toàn bộ khách hàng và đối chiếu với tiêu chí của từng Segment
+$logs[] = "[Segment] Syncing membership counts...";
+$stmtSegs = $pdo->query("SELECT * FROM segments");
+$allSegments = $stmtSegs->fetchAll();
+$stmtSubs = $pdo->query("SELECT * FROM subscribers");
+$allSubscribers = $stmtSubs->fetchAll();
+
+foreach ($allSegments as $seg) {
+    $matchCount = 0;
+    foreach ($allSubscribers as $sub) {
+        if (isSubscriberMatch($sub, $seg['criteria'])) {
+            $matchCount++;
+        }
+    }
+    $pdo->prepare("UPDATE segments SET subscriber_count = ? WHERE id = ?")->execute([$matchCount, $seg['id']]);
+}
+
+// --- PHẦN 3: TRIGGERS (PHÂN LUỒNG KHÁCH HÀNG) ---
+$stmtActiveFlows = $pdo->query("SELECT * FROM flows WHERE status = 'active'");
+foreach ($stmtActiveFlows->fetchAll() as $flow) {
+    $steps = json_decode($flow['steps'], true); $trigger = null;
+    foreach($steps as $s) if($s['type'] === 'trigger') $trigger = $s;
+    if (!$trigger || !isset($trigger['nextStepId'])) continue;
+
+    $eligible = []; $tConfig = $trigger['config']; $tType = $tConfig['type'] ?? 'segment';
+    
+    if ($tType === 'segment') {
+        $stmtSeg = $pdo->prepare("SELECT criteria FROM segments WHERE id = ?"); 
+        $stmtSeg->execute([$tConfig['targetId']]);
+        $segDef = $stmtSeg->fetch();
+        if ($segDef) {
+            // Chỉ lấy những người chưa có trong Flow này (hoặc đã hoàn thành lâu rồi tùy chính sách)
+            $sql = "SELECT s.* FROM subscribers s 
+                    LEFT JOIN subscriber_flow_states sfs ON s.id = sfs.subscriber_id AND sfs.flow_id = ? 
+                    WHERE s.status = 'active' AND sfs.id IS NULL";
+            $stmtS = $pdo->prepare($sql); $stmtS->execute([$flow['id']]);
+            foreach ($stmtS->fetchAll() as $sub) { 
+                if (isSubscriberMatch($sub, $segDef['criteria'])) $eligible[] = $sub; 
+            }
+        }
+    } else if ($tType === 'date') {
+        // ... (Giữ nguyên logic sinh nhật/joinedAt đã ổn định) ...
+        $field = $tConfig['dateField'] ?? 'dateOfBirth';
+        if ($field === 'joinedAt') {
+            $amount = (int)($tConfig['gapAmount'] ?? 1); $unit = $tConfig['gapUnit'] ?? 'MONTH';
+            $sql = "SELECT s.id, s.email FROM subscribers s LEFT JOIN subscriber_flow_states sfs ON s.id = sfs.subscriber_id AND sfs.flow_id = ? WHERE s.status = 'active' AND DATE(s.joined_at) = DATE_SUB(CURDATE(), INTERVAL $amount $unit) AND sfs.id IS NULL";
+            $stmtS = $pdo->prepare($sql); $stmtS->execute([$flow['id']]); $eligible = $stmtS->fetchAll();
+        } else if ($field === 'lastActivity') {
+            $amount = (int)($tConfig['inactiveAmount'] ?? 30); $unit = $tConfig['inactiveUnit'] ?? 'DAY';
+            $sql = "SELECT s.* FROM subscribers s LEFT JOIN subscriber_flow_states sfs ON s.id = sfs.subscriber_id AND sfs.flow_id = ? WHERE s.status = 'active' AND (s.last_open_at < DATE_SUB(NOW(), INTERVAL $amount $unit) OR s.last_open_at IS NULL) AND (s.last_click_at < DATE_SUB(NOW(), INTERVAL $amount $unit) OR s.last_click_at IS NULL) AND s.joined_at < DATE_SUB(NOW(), INTERVAL $amount $unit) AND sfs.id IS NULL";
+            $stmtS = $pdo->prepare($sql); $stmtS->execute([$flow['id']]);
+            foreach ($stmtS->fetchAll() as $sub) { $eligible[] = $sub; }
+        } else {
+            $dbField = ($field === 'anniversaryDate') ? 'anniversary_date' : 'date_of_birth';
+            $sql = "SELECT s.id, s.email FROM subscribers s LEFT JOIN subscriber_flow_states sfs ON s.id = sfs.subscriber_id AND sfs.flow_id = ? AND DATE(sfs.created_at) = CURDATE() WHERE s.status = 'active' AND DATE_FORMAT(s.$dbField, '%m-%d') = ? AND sfs.id IS NULL";
+            $stmtS = $pdo->prepare($sql); $stmtS->execute([$flow['id'], $todayMD]); $eligible = $stmtS->fetchAll();
+        }
+    }
+
+    if (count($eligible) > 0 && !$checkOnly) {
+        $stmtE = $pdo->prepare("INSERT INTO subscriber_flow_states (subscriber_id, flow_id, step_id, scheduled_at, status) VALUES (?, ?, ?, NOW(), 'waiting')");
+        foreach ($eligible as $sub) { $stmtE->execute([$sub['id'], $flow['id'], $trigger['nextStepId']]); }
+        $pdo->prepare("UPDATE flows SET stat_enrolled = stat_enrolled + ? WHERE id = ?")->execute([count($eligible), $flow['id']]);
+    }
+}
+
+// --- PHẦN 4: ENGINE THỰC THI (RUNTIME ENGINE) ---
+if (!$checkOnly) {
+    $stmtQueue = $pdo->prepare("SELECT q.*, f.steps as flow_steps, f.config as flow_config, f.name as flow_name, s.id as sub_id, s.email as sub_email, s.status as sub_status, s.tags as sub_tags, s.stats_opened, s.stats_clicked, s.last_open_at, s.last_click_at FROM subscriber_flow_states q JOIN flows f ON q.flow_id = f.id JOIN subscribers s ON q.subscriber_id = s.id WHERE q.status = 'waiting' AND q.scheduled_at <= ? AND f.status = 'active'");
+    $stmtQueue->execute([$now]);
+    
+    foreach ($stmtQueue->fetchAll() as $item) {
+        $steps = json_decode($item['flow_steps'], true); 
+        $fConfig = json_decode($item['flow_config'], true) ?: [];
+        $currentStep = null; foreach ($steps as $s) if ($s['id'] === $item['step_id']) $currentStep = $s;
+        if (!$currentStep) { $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed' WHERE id = ?")->execute([$item['id']]); continue; }
+        
+        // 4.1. KIỂM TRA ĐIỀU KIỆN THOÁT (EXIT CONDITIONS)
+        $shouldExit = ($item['sub_status'] !== 'active');
+        
+        // Logic mới: Tự động thoát nếu không còn khớp với Segment ban đầu (nếu Trigger là Segment)
+        $trigger = null; foreach($steps as $s) if($s['type'] === 'trigger') $trigger = $s;
+        if (!$shouldExit && $trigger && $trigger['config']['type'] === 'segment') {
+            $stmtCheckSeg = $pdo->prepare("SELECT criteria FROM segments WHERE id = ?");
+            $stmtCheckSeg->execute([$trigger['config']['targetId']]);
+            $criteria = $stmtCheckSeg->fetchColumn();
+            if ($criteria && !isSubscriberMatch($item, $criteria)) {
+                $logs[] = "[Exit] User {$item['sub_email']} no longer matches segment criteria. Removing from Flow.";
+                $shouldExit = true;
+            }
+        }
+
+        if ($shouldExit) { 
+            $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed' WHERE id = ?")->execute([$item['id']]); 
+            continue; 
+        }
+
+        // 4.2. KIỂM TRA LỊCH GỬI & CAPPING (CHỈ CHO EMAIL)
+        if ($currentStep['type'] === 'action') {
+            $activeDays = $fConfig['activeDays'] ?? [0,1,2,3,4,5,6];
+            $startTime = $fConfig['startTime'] ?? '00:00'; $endTime = $fConfig['endTime'] ?? '23:59';
+            if (!in_array($currentDayIdx, $activeDays) || $currentTime < $startTime || $currentTime > $endTime) continue;
+            $cap = (int)($fConfig['frequencyCap'] ?? 0);
+            if ($cap > 0) {
+                $stmtCap = $pdo->prepare("SELECT COUNT(*) FROM mail_delivery_logs WHERE recipient = ? AND sent_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)");
+                $stmtCap->execute([$item['sub_email']]);
+                if ($stmtCap->fetchColumn() >= $cap) continue; 
+            }
+        }
+
+        // 4.3. THỰC THI BƯỚC HIỆN TẠI
+        $nextStepId = null; $nextScheduledAt = $now; $shouldUpdateQueue = true;
+        switch ($currentStep['type']) {
+            case 'action':
+                $userCtx = ['email' => $item['sub_email'], 'id' => $item['sub_id']];
+                $stepAttachments = processAttachments($currentStep['config']['attachments'] ?? '[]', $userCtx, $apiUrl);
+                $res = $mailer->send($item['sub_email'], $currentStep['config']['subject'], $currentStep['config']['contentBody'] ?? '', $item['subscriber_id'], null, $item['flow_id'], $item['flow_name'], $stepAttachments);
+                if ($res === true) $pdo->prepare("UPDATE flows SET stat_total_sent = stat_total_sent + 1 WHERE id = ?")->execute([$item['flow_id']]);
+                $nextStepId = $currentStep['nextStepId'] ?? null; break;
+                
+            case 'wait':
+                $duration = (int)($currentStep['config']['duration'] ?? 1); $unit = $currentStep['config']['unit'] ?? 'hours';
+                $date = new DateTime($now); $date->modify("+$duration $unit");
+                $nextScheduledAt = $date->format('Y-m-d H:i:s'); $nextStepId = $currentStep['nextStepId'] ?? null; break;
+                
+            case 'condition':
+                $condType = $currentStep['config']['conditionType'] ?? 'opened';
+                $waitDur = (int)($currentStep['config']['waitDuration'] ?? 1); $waitUnit = $currentStep['config']['waitUnit'] ?? 'hours';
+                $linkTarget = $currentStep['config']['linkTarget'] ?? null;
+                $actType = ($condType === 'clicked') ? 'click_link' : (($condType === 'replied') ? 'reply_email' : 'open_email');
+                
+                $sql = "SELECT id FROM subscriber_activity WHERE subscriber_id = ? AND reference_id = ? AND type = ? AND created_at >= ?";
+                $params = [$item['subscriber_id'], $item['flow_id'], $actType, $item['created_at']];
+                if ($linkTarget) { $sql .= " AND details = ?"; $params[] = $linkTarget; }
+                $stmtAct = $pdo->prepare($sql); $stmtAct->execute($params);
+                
+                if ($stmtAct->fetch()) { $nextStepId = $currentStep['yesStepId'] ?? null; }
+                else {
+                    $timeout = new DateTime($item['created_at']); $timeout->modify("+$waitDur $waitUnit");
+                    if (new DateTime($now) > $timeout) $nextStepId = $currentStep['noStepId'] ?? null; 
+                    else $shouldUpdateQueue = false; 
+                } break;
+                
+            case 'update_tag':
+                $existing = json_decode($item['sub_tags'] ?? '[]', true); $tagsToApply = $currentStep['config']['tags'] ?? [];
+                $newTags = ($currentStep['config']['action'] === 'remove') ? array_values(array_diff($existing, $tagsToApply)) : array_unique(array_merge($existing, $tagsToApply));
+                $pdo->prepare("UPDATE subscribers SET tags = ? WHERE id = ?")->execute([json_encode($newTags), $item['subscriber_id']]);
+                $nextStepId = $currentStep['nextStepId'] ?? null; break;
+                
+            case 'split_test':
+                $nextStepId = (rand(1, 100) <= (int)($currentStep['config']['ratioA'] ?? 50)) ? ($currentStep['pathAStepId'] ?? null) : ($currentStep['pathBStepId'] ?? null); break;
+                
+            case 'link_flow':
+                if (!empty($currentStep['config']['linkedFlowId'])) {
+                    $pdo->prepare("INSERT INTO subscriber_flow_states (subscriber_id, flow_id, step_id, scheduled_at, status) VALUES (?, ?, ?, NOW(), 'waiting')")
+                        ->execute([$item['subscriber_id'], $currentStep['config']['linkedFlowId'], 'trigger']);
+                }
+                $nextStepId = null; break;
+
+            case 'remove_action':
+                if ($currentStep['config']['actionType'] === 'unsubscribe') $pdo->prepare("UPDATE subscribers SET status = 'unsubscribed' WHERE id = ?")->execute([$item['subscriber_id']]);
+                else if ($currentStep['config']['actionType'] === 'delete_contact') $pdo->prepare("DELETE FROM subscribers WHERE id = ?")->execute([$item['subscriber_id']]);
+                $nextStepId = null; break;
+        }
+
+        if ($shouldUpdateQueue) {
+            if ($nextStepId) {
+                $pdo->prepare("UPDATE subscriber_flow_states SET step_id = ?, scheduled_at = ?, status = 'waiting', created_at = NOW() WHERE id = ?")
+                    ->execute([$nextStepId, $nextScheduledAt, $item['id']]);
+            } else {
+                $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed' WHERE id = ?")->execute([$item['id']]);
+                $pdo->prepare("UPDATE flows SET stat_completed = stat_completed + 1 WHERE id = ?")->execute([$item['flow_id']]);
+            }
+        }
+    }
+}
+
+echo implode("\n", $logs);
+?>

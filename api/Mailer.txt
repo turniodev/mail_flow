@@ -1,0 +1,163 @@
+<?php
+// api/Mailer.php - VERSION V26.2 (PHPMailer Syntax Fix)
+class Mailer {
+    private $pdo;
+    private $baseUrl;
+    private $defaultSender;
+    private $smtpSettings = null;
+
+    public function __construct($pdo, $baseUrl, $defaultSender = 'marketing@ka-en.com.vn') {
+        $this->pdo = $pdo;
+        // Đảm bảo baseUrl không có dấu / ở cuối để nối chuỗi cho chuẩn
+        $this->baseUrl = rtrim($baseUrl, '/'); 
+        $this->defaultSender = $defaultSender;
+        $this->loadSettings();
+    }
+
+    private function loadSettings() {
+        $stmt = $this->pdo->query("SELECT * FROM system_settings");
+        $this->smtpSettings = [];
+        foreach ($stmt->fetchAll() as $row) { $this->smtpSettings[$row['key']] = $row['value']; }
+    }
+
+    public function send($toEmail, $subject, $htmlContent, $subscriberId, $campaignId = null, $flowId = null, $flowName = null, $attachments = []) {
+        $utmCampaign = $flowName ? urlencode($flowName) : ($campaignId ? "camp_$campaignId" : "direct");
+        
+        $unsubUrl = $this->baseUrl . "/webhook.php?type=unsubscribe&sid=$subscriberId" . ($flowId ? "&fid=$flowId" : "") . ($campaignId ? "&cid=$campaignId" : "");
+        $htmlContent = str_replace('{{unsubscribe_url}}', $unsubUrl, $htmlContent);
+
+        // Inject Tracking
+        // FIX: Thêm flowId và campaignId vào injectSmartTracking để ghi log chính xác hơn
+        $trackedHtml = $this->injectSmartTracking($htmlContent, $campaignId, $flowId, $subscriberId, $utmCampaign, $flowName);
+        
+        $fromEmail = (isset($this->smtpSettings['smtp_user']) && filter_var($this->smtpSettings['smtp_user'], FILTER_VALIDATE_EMAIL)) 
+                     ? $this->smtpSettings['smtp_user'] : $this->defaultSender;
+        $fromName = $this->smtpSettings['smtp_from_name'] ?? "Marketing System";
+
+        $success = false; $error = "";
+        
+        if (isset($this->smtpSettings['smtp_enabled']) && $this->smtpSettings['smtp_enabled'] === '1') {
+            $host = strtolower($this->smtpSettings['smtp_host'] ?? '');
+            if (strpos($host, 'brevo') !== false || strpos($host, 'sendinblue') !== false) {
+                $success = $this->sendViaBrevoAPI($toEmail, $subject, $trackedHtml, $fromEmail, $fromName, $attachments, $error);
+            } else {
+                $success = $this->sendViaPHPMailer($toEmail, $subject, $trackedHtml, $fromEmail, $fromName, $attachments, $error);
+            }
+        } else {
+            $headers = array('MIME-Version: 1.0', 'Content-type: text/html; charset=UTF-8', 'From: '.$fromName.' <'.$fromEmail.'>', 'Reply-To: '.$fromEmail);
+            $success = @mail($toEmail, $subject, $trackedHtml, implode("\r\n", $headers), "-f".$fromEmail);
+        }
+
+        $stmtLog = $this->pdo->prepare("INSERT INTO mail_delivery_logs (recipient, subject, status, error_message, sent_at) VALUES (?, ?, ?, ?, NOW())");
+        $stmtLog->execute([$toEmail, $subject, $success ? 'success' : 'failed', $error]);
+        
+        return $success ? true : $error;
+    }
+
+    private function injectSmartTracking($html, $cid, $fid, $sid, $utmCamp, $flowName) {
+        if (!$html) $html = "<html><body></body></html>";
+        $fNameEnc = urlencode($flowName ?? '');
+
+        // 1. TRACKING LINKS (CLICK) - UPDATED REGEX
+        // Matches <a ... href="..." ...> allowing attributes before/after href
+        $pattern = '/<a\s+(?:[^>]*?\s+)?href=(["\'])(?!#|mailto|tel|{{unsubscribe_url}})([^"\']+)\1/i';
+        
+        $html = preg_replace_callback($pattern, function($m) use ($cid, $fid, $sid, $utmCamp, $fNameEnc) { // FIX: Pass fid and cid to closure
+            $originalQuote = $m[1];
+            $originalUrl = $m[2];
+            
+            // Nếu link đã là tracking link của hệ thống mình thì bỏ qua (tránh double encoding)
+            if (strpos($originalUrl, $this->baseUrl . '/webhook.php') !== false) return $m[0];
+
+            $connector = (strpos($originalUrl, '?') !== false) ? '&' : '?';
+            $urlWithUtm = $originalUrl . $connector . "utm_source=mailflow&utm_medium=email&utm_campaign=$utmCamp";
+            
+            // Xây dựng Link Tracking
+            $trackingUrl = $this->baseUrl . "/webhook.php?type=click&sid=$sid" . ($fid ? "&fid=$fid" : "") . ($cid ? "&cid=$cid" : "") . "&fn=$fNameEnc&url=" . base64_encode($urlWithUtm);
+            
+            // Reconstruct the start of the tag carefully replacing only the href part we matched
+            // Note: preg_replace_callback passes the FULL match in $m[0]. 
+            // Since our regex matches the *start* of the tag up to the href value, we can substitute.
+            
+            // We need to be careful not to lose attributes before href.
+            // $m[0] is e.g. <a class="btn" href="url"
+            // We replace href="url" with href="trackingUrl"
+            
+            return str_replace($originalUrl, $trackingUrl, $m[0]);
+        }, $html);
+
+        // 2. TRACKING PIXEL (OPEN)
+        $tp = http_build_query(['type' => 'open', 'cid' => $cid ?? '', 'fid' => $fid ?? '', 'sid' => $sid, 'fn' => $flowName ?? '']);
+        // Sử dụng style display:none để ẩn nhưng vẫn load, hoặc kích thước 1x1
+        $pixel = '<img src="' . $this->baseUrl . "/webhook.php?" . $tp . '" width="1" height="1" alt="" style="display:block; width:1px; height:1px; border:0; margin:0;" />';
+        
+        return (strpos($html, '</body>') !== false) ? str_replace('</body>', $pixel . '</body>', $html) : $html . $pixel;
+    }
+
+    private function sendViaBrevoAPI($to, $subject, $body, $fromEmail, $fromName, $attachments, &$error) {
+        $apiKey = trim($this->smtpSettings['smtp_pass'] ?? '');
+        $url = 'https://api.brevo.com/v3/smtp/email';
+        $data = ['sender' => ['name' => $fromName, 'email' => $fromEmail], 'to' => [['email' => $to]], 'subject' => $subject, 'htmlContent' => $body];
+        
+        // Add attachments if provided
+        if (!empty($attachments)) {
+            $brevoAttachments = [];
+            foreach ($attachments as $att) {
+                // Assuming $att['path'] is the internal server path
+                if (file_exists($att['path'])) {
+                    $brevoAttachments[] = [
+                        'content' => base64_encode(file_get_contents($att['path'])),
+                        'name' => $att['name']
+                    ];
+                }
+            }
+            if (!empty($brevoAttachments)) {
+                $data['attachments'] = $brevoAttachments;
+            }
+        }
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['api-key: ' . $apiKey, 'Content-Type: application/json']);
+        $res = curl_exec($ch); $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+        if ($httpCode >= 200 && $httpCode < 300) return true;
+        $error = "Brevo Error ($httpCode)"; return false;
+    }
+
+    private function sendViaPHPMailer($to, $subject, $body, $fromEmail, $fromName, $attachments, &$error) {
+        require_once __DIR__ . '/PHPMailer/src/PHPMailer.php';
+        require_once __DIR__ . '/PHPMailer/src/SMTP.php';
+        require_once __DIR__ . '/PHPMailer/src/Exception.php';
+        $mail = new PHPMailer\PHPMailer\PHPMailer(true);
+        try {
+            $mail->isSMTP(); 
+            $mail->Host = $this->smtpSettings['smtp_host']; 
+            $mail->SMTPAuth = true;
+            $mail->Username = $this->smtpSettings['smtp_user']; 
+            $mail->Password = $this->smtpSettings['smtp_pass'];
+            $mail->SMTPSecure = ($this->smtpSettings['smtp_port'] == '465') ? 'ssl' : 'tls';
+            $mail->Port = (int)$this->smtpSettings['smtp_port']; 
+            $mail->CharSet = 'UTF-8';
+            $mail->setFrom($fromEmail, $fromName); 
+            $mail->addAddress($to); 
+            $mail->isHTML(true); 
+            $mail->Subject = $subject; 
+            $mail->Body = $body;
+            
+            // Add attachments
+            if (!empty($attachments)) {
+                foreach ($attachments as $att) {
+                    if (file_exists($att['path'])) {
+                        $mail->addAttachment($att['path'], $att['name']);
+                    }
+                }
+            }
+
+            $mail->send(); return true;
+        } catch (Exception $e) { $error = $mail->ErrorInfo; return false; }
+    }
+}
+?>

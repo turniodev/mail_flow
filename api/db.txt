@@ -1,0 +1,24 @@
+
+
+-- ... (Previous SQL) ...
+
+-- 8. Bảng Chiến dịch (Campaigns)
+
+
+-- [MIGRATE COMMAND]
+ALTER TABLE `campaigns` ADD COLUMN `attachments` JSON;
+
+-- Bổ sung cột notes cho subscribers (nếu chưa có)
+ALTER TABLE `subscribers` ADD COLUMN IF NOT EXISTS `notes` JSON DEFAULT '[]' AFTER `anniversary_date`;
+
+-- Cập nhật bảng activity để lưu tối đa 10 hoạt động gần nhất (Logic này sẽ được xử lý trong worker.php)
+-- Không cần thay đổi cấu trúc bảng, chỉ cần thay đổi query INSERT trong worker/webhook.
+
+-- Bổ sung cột flow_id và campaign_id vào subscriber_activity
+ALTER TABLE `subscriber_activity` ADD COLUMN IF NOT EXISTS `flow_id` CHAR(36) DEFAULT NULL AFTER `reference_id`;
+ALTER TABLE `subscriber_activity` ADD COLUMN IF NOT EXISTS `campaign_id` CHAR(36) DEFAULT NULL AFTER `flow_id`;
+
+-- Cập nhật các chỉ mục nếu cần để hỗ trợ truy vấn nhanh hơn trên các cột mới
+-- Ví dụ (nếu chưa tồn tại):
+-- ALTER TABLE `subscriber_activity` ADD INDEX `idx_flow_activity` (`flow_id`, `created_at`);
+-- ALTER TABLE `subscriber_activity` ADD INDEX `idx_campaign_activity` (`campaign_id`, `created_at`);

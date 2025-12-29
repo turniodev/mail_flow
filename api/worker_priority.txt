@@ -1,0 +1,620 @@
+<?php
+// api/worker_priority.php - OMNI-ENGINE V29.5 (PRIORITY CHAINING ENGINE - FINAL FIX FOR INSTANT EXECUTION)
+// This worker is triggered directly by API calls (forms.php, purchase_events.php, custom_events.php)
+// to immediately enroll a SPECIFIC subscriber into relevant flows AND execute the *initial chain of instant steps*.
+
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE); 
+ini_set('display_errors', 0);
+set_time_limit(60); // Max 60 seconds for priority enrollment and initial chain execution
+
+require_once 'db_connect.php';
+require_once 'Mailer.php'; // Mailer is required here for sending emails within the priority chain
+
+date_default_timezone_set('Asia/Ho_Chi_Minh');
+$pdo->exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
+
+// Params
+$prioritySid = $_GET['subscriber_id'] ?? null;
+$priorityTriggerType = $_GET['trigger_type'] ?? null;
+$priorityTargetId = $_GET['target_id'] ?? null;
+$priorityQueueId = $_GET['priority_queue_id'] ?? null; // For direct processing of an existing queue item
+
+$logs = [];
+$logs[] = "--- PRIORITY WORKER START: " . date('Y-m-d H:i:s') . " ---";
+
+$protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http";
+$apiUrl = "$protocol://".$_SERVER['HTTP_HOST'].dirname(dirname($_SERVER['PHP_SELF']));
+$stmt = $pdo->query("SELECT * FROM system_settings");
+$settings = [];
+foreach ($stmt->fetchAll() as $row) { $settings[$row['key']] = $row['value']; }
+$defaultSender = !empty($settings['smtp_user']) ? $settings['smtp_user'] : "marketing@ka-en.com.vn"; 
+$mailer = new Mailer($pdo, $apiUrl, $defaultSender);
+
+$now = date('Y-m-d H:i:s');
+$currentTime = date('H:i');
+$currentDayIdx = (date('w') == 0) ? 6 : date('w') - 1; 
+
+
+// =================================================================================
+// HELPER: Log Activity with Limit (Replicated for self-sufficiency)
+// =================================================================================
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    $count = $stmtCount->fetchColumn();
+
+    if ($count > 10) {
+        $stmtDel = $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1");
+        $stmtDel->execute([$subscriberId]);
+    }
+}
+
+// =================================================================================
+// HELPER: Parse Dynamic Looping Content (Replicated for self-sufficiency)
+// =================================================================================
+function parseLoopingContent($html, $context) {
+    return preg_replace_callback('/<!-- START_ITEM_LOOP -->(.*?)<!-- END_ITEM_LOOP -->/s', function($matches) use ($context) {
+        $template = $matches[1];
+        $output = '';
+        $items = $context['items'] ?? [];
+        if (is_array($items) && count($items) > 0) {
+            foreach ($items as $item) {
+                $row = $template;
+                foreach ($item as $key => $val) {
+                    $row = str_replace("{{item.$key}}", $val, $row);
+                }
+                $output .= $row;
+            }
+        }
+        return $output;
+    }, $html);
+}
+
+// =================================================================================
+// HELPER: Resolve Email Content & Apply Logic (Replicated for self-sufficiency)
+// =================================================================================
+function resolveEmailContent($pdo, $templateId, $customHtml, $fallbackBody = '', $context = []) {
+    $htmlContent = '';
+    if ($templateId && $templateId !== 'custom-html') {
+        $stmt = $pdo->prepare("SELECT html_content FROM templates WHERE id = ?");
+        $stmt->execute([$templateId]);
+        $htmlContent = $stmt->fetchColumn();
+        if ($htmlContent && $fallbackBody && strpos($htmlContent, '{{body}}') !== false) {
+            $htmlContent = str_replace('{{body}}', $fallbackBody, $htmlContent);
+        }
+    } elseif ($templateId === 'custom-html' || !empty($customHtml)) {
+        $htmlContent = !empty($customHtml) ? $customHtml : $fallbackBody;
+    } else {
+        $htmlContent = $fallbackBody;
+    }
+    if (!$htmlContent) $htmlContent = "<html><body><p>(No Content)</p></body></html>";
+    $htmlContent = parseLoopingContent($htmlContent, $context);
+    return $htmlContent;
+}
+
+// =================================================================================
+// HELPER: Replace Merge Tags (Variables) (Replicated for self-sufficiency)
+// =================================================================================
+function replaceMergeTags($html, $subscriber, $context = []) {
+    $firstName = $subscriber['first_name'] ?? '';
+    $lastName = $subscriber['last_name'] ?? '';
+    $fullName = trim($firstName . ' ' . $lastName);
+    $email = $subscriber['email'] ?? '';
+    
+    $map = [
+        '{{first_name}}' => $firstName,
+        '{{last_name}}' => $lastName,
+        '{{full_name}}' => $fullName ?: 'Bạn',
+        '{{email}}' => $email,
+        '{{company_name}}' => $subscriber['company_name'] ?? '',
+        '{{phone}}' => $subscriber['phone_number'] ?? '',
+        '{{job_title}}' => $subscriber['job_title'] ?? '',
+        '{{year}}' => date('Y'),
+        '{{date}}' => date('d/m/Y')
+    ];
+
+    foreach ($context as $key => $val) {
+        if (is_string($val) || is_numeric($val)) {
+            $map["{{$key}}"] = $val;
+        }
+    }
+
+    return str_replace(array_keys($map), array_values($map), $html);
+}
+
+// =================================================================================
+// HELPER: isSubscriberMatch (Replicated for self-sufficiency)
+// =================================================================================
+function isSubscriberMatch($sub, $criteriaJson) {
+    if (empty($criteriaJson)) return true;
+    $groups = json_decode($criteriaJson, true);
+    if (!$groups || !is_array($groups)) return false;
+    foreach ($groups as $group) {
+        $groupMatch = true;
+        if (!isset($group['conditions']) || !is_array($group['conditions'])) continue;
+        
+        foreach ($group['conditions'] as $cond) {
+            $field = $cond['field']; $op = $cond['operator']; $val = strtolower($cond['value'] ?? '');
+            $actualVal = "";
+            
+            if (strpos($field, 'stats.') === 0) {
+                $statKey = str_replace('stats.', '', $field);
+                if ($statKey == 'emailsOpened') $actualVal = $sub['stats_opened'] ?? 0;
+                else if ($statKey == 'linksClicked') $actualVal = $sub['stats_clicked'] ?? 0;
+            } else if ($field === 'tags') {
+                // Ensure tags are always treated as an array for comparison
+                $subTags = json_decode($sub['tags'] ?? '[]', true);
+                if (!is_array($subTags)) $subTags = [];
+                
+                $isMatch = false;
+                if ($op === 'contains') {
+                    $isMatch = in_array(strtolower($val), array_map('strtolower', $subTags));
+                } else if ($op === 'not_contains') {
+                    $isMatch = !in_array(strtolower($val), array_map('strtolower', $subTags));
+                }
+                if (!$isMatch) { $groupMatch = false; break; }
+                continue; // Skip rest of switch for tags
+            } else { 
+                $actualVal = $sub[$field] ?? ""; 
+            }
+            
+            $actualVal = (string)$actualVal;
+            $isMatch = false;
+
+            switch ($op) {
+                case 'contains': 
+                    if (strpos(strtolower($actualVal), $val) !== false) $isMatch = true; 
+                    break;
+                case 'not_contains': 
+                    if (strpos(strtolower($actualVal), $val) === false) $isMatch = true; 
+                    break;
+                case 'equals': case 'is': 
+                    if (strtolower($actualVal) == $val) $isMatch = true; 
+                    break;
+                case 'is_not': 
+                    if (strtolower($actualVal) != $val) $isMatch = true; 
+                    break;
+                case 'starts_with': 
+                    if (substr(strtolower($actualVal), 0, strlen($val)) === $val) $isMatch = true; 
+                    break;
+                case 'greater_than': 
+                    if ((float)$actualVal > (float)$val) $isMatch = true; 
+                    break;
+                case 'less_than': 
+                    if ((float)$actualVal < (float)$val) $isMatch = true; 
+                    break;
+                case 'after': 
+                    if (strtotime($actualVal) > strtotime($val)) $isMatch = true; 
+                    break;
+                case 'before': 
+                    if (strtotime($actualVal) < strtotime($val)) $isMatch = true; 
+                    break;
+                case 'on': // New operator for exact date match
+                    if (date('Y-m-d', strtotime($actualVal)) === $val) $isMatch = true;
+                    break;
+            }
+            
+            if (!$isMatch) { $groupMatch = false; break; }
+        }
+        if ($groupMatch) return true; // Satisfy any Group (OR) is a match
+    }
+    return false;
+}
+
+// =================================================================================
+// PRIORITY ENROLLMENT AND IMMEDIATE CHAIN EXECUTION
+// =================================================================================
+$pdo->beginTransaction();
+try {
+    $item = null;
+    if ($priorityQueueId) { // If called with an existing queue ID (from self-triggering)
+        $stmtItem = $pdo->prepare("SELECT q.id as queue_id, q.subscriber_id, q.flow_id, q.step_id, q.created_at as queue_created_at, 
+                                 f.steps as flow_steps, f.config as flow_config, f.name as flow_name, 
+                                 s.email as sub_email, s.first_name, s.last_name, s.company_name, s.phone_number, s.job_title,
+                                 s.status as sub_status, s.tags as sub_tags, s.id as sub_id, s.date_of_birth, s.anniversary_date,
+                                 s.stats_opened, s.stats_clicked, s.last_open_at, s.last_click_at
+                                 FROM subscriber_flow_states q 
+                                 JOIN flows f ON q.flow_id = f.id 
+                                 JOIN subscribers s ON q.subscriber_id = s.id 
+                                 WHERE q.id = ? AND q.subscriber_id = ? AND q.flow_id = ? AND q.status IN ('waiting', 'processing') AND f.status = 'active'
+                                 LIMIT 1 FOR UPDATE SKIP LOCKED"); 
+    
+    // Using a nested transaction here is problematic for `FOR UPDATE`.
+    // Instead, rely on the main transaction around the whole worker run,
+    // and if item is not found/locked, exit gracefully.
+    $stmtItem->execute([$priorityQueueId, $prioritySid, $priorityFlowId]); // Fix: Use prioritySid and priorityFlowId directly
+    $priorityItem = $stmtItem->fetch();
+
+    if ($priorityItem) {
+        $initialStatus = $priorityItem['status'];
+        // Mark priority item as processing immediately
+        $pdo->prepare("UPDATE subscriber_flow_states SET status = 'processing', updated_at = NOW() WHERE id = ?")->execute([$priorityQueueId]);
+        $item = $priorityItem; 
+        $logs[] = "[Priority-Chain] Item $priorityQueueId found. Initial status: '{$initialStatus}'. Now 'processing'.";
+    } else {
+        $logs[] = "[Priority-Chain] Item $priorityQueueId not found or not in 'waiting'/'processing' state.";
+        $pdo->commit(); exit; // Commit and exit if no item found
+    }
+
+    } else if ($prioritySid && $priorityTriggerType && $priorityTargetId) { // If called for a new enrollment
+        $logs[] = "[Priority-Enroll] Received Trigger: $priorityTriggerType ID: $priorityTargetId for Subscriber $prioritySid";
+        
+        $stmtFlows = $pdo->prepare("SELECT id, name, steps FROM flows WHERE status = 'active'");
+        $stmtFlows->execute();
+        $activeFlows = $stmtFlows->fetchAll();
+
+        foreach ($activeFlows as $flow) {
+            $steps = json_decode($flow['steps'], true);
+            $trigger = null;
+            foreach ($steps as $s) if ($s['type'] === 'trigger') $trigger = $s;
+            
+            if (!$trigger || !isset($trigger['nextStepId'])) continue;
+            
+            $tConfig = $trigger['config'];
+            $flowTriggerType = $tConfig['type'] ?? 'segment';
+            $flowTargetId = $tConfig['targetId'] ?? '';
+
+            if ($flowTriggerType === $priorityTriggerType && $flowTargetId == $priorityTargetId) {
+                // Re-enrollment check: Remove any existing waiting/processing state for this subscriber in this flow
+                $pdo->prepare("DELETE FROM subscriber_flow_states WHERE subscriber_id = ? AND flow_id = ? AND status IN ('waiting', 'processing')")->execute([$prioritySid, $flow['id']]);
+                $logs[] = "[Priority-Enroll] Cleared existing waiting/processing state for Subscriber $prioritySid in Flow {$flow['name']} for re-enrollment.";
+
+                $pastTime = date('Y-m-d H:i:s', strtotime('-1 second')); 
+                $stmtE = $pdo->prepare("INSERT INTO subscriber_flow_states (subscriber_id, flow_id, step_id, scheduled_at, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'processing', NOW(), NOW())"); // Start as 'processing'
+                $stmtE->execute([$prioritySid, $flow['id'], $trigger['nextStepId'], $pastTime]);
+                
+                $newQueueId = $pdo->lastInsertId();
+
+                // FIX: Cải thiện details cho log enter_flow
+                $detailMessage = "Priority Trigger: {$priorityTriggerType}";
+                // Thêm thông tin cụ thể hơn nếu có
+                if ($priorityTriggerType === 'form') {
+                    $stmtFormName = $pdo->prepare("SELECT name FROM forms WHERE id = ?");
+                    $stmtFormName->execute([$priorityTargetId]);
+                    $formName = $stmtFormName->fetchColumn();
+                    $detailMessage .= " (Form: '" . ($formName ?: $priorityTargetId) . "')";
+                } elseif ($priorityTriggerType === 'purchase') {
+                    $stmtEventName = $pdo->prepare("SELECT name FROM purchase_events WHERE id = ?");
+                    $stmtEventName->execute([$priorityTargetId]);
+                    $eventName = $stmtEventName->fetchColumn();
+                    $detailMessage .= " (Purchase Event: '" . ($eventName ?: $priorityTargetId) . "')";
+                } elseif ($priorityTriggerType === 'custom_event') {
+                    $stmtEventName = $pdo->prepare("SELECT name FROM custom_events WHERE id = ?");
+                    $stmtEventName->execute([$priorityTargetId]);
+                    $eventName = $stmtEventName->fetchColumn();
+                    $detailMessage .= " (Custom Event: '" . ($eventName ?: $priorityTargetId) . "')";
+                } elseif ($priorityTriggerType === 'tag') {
+                    $detailMessage .= " (Tag: '{$priorityTargetId}')"; // Tag name is already in priorityTargetId
+                }
+                
+                logActivity($pdo, $prioritySid, 'enter_flow', $flow['id'], $flow['name'], $detailMessage, $flow['id']); // FIX: Pass flow_id
+                $pdo->prepare("UPDATE flows SET stat_enrolled = stat_enrolled + 1 WHERE id = ?")->execute([$flow['id']]);
+                $logs[] = "[Priority-Enroll] Enrolled Subscriber $prioritySid into Flow {$flow['name']} with Queue ID: {$newQueueId}.";
+                
+                // Fetch the newly created item to start the chain
+                $stmtItem = $pdo->prepare("SELECT q.id as queue_id, q.subscriber_id, q.flow_id, q.step_id, q.created_at as queue_created_at, 
+                                         f.steps as flow_steps, f.config as flow_config, f.name as flow_name, 
+                                         s.email as sub_email, s.first_name, s.last_name, s.company_name, s.phone_number, s.job_title,
+                                         s.status as sub_status, s.tags as sub_tags, s.id as sub_id, s.date_of_birth, s.anniversary_date,
+                                         s.stats_opened, s.stats_clicked, s.last_open_at, s.last_click_at
+                                         FROM subscriber_flow_states q 
+                                         JOIN flows f ON q.flow_id = f.id 
+                                         JOIN subscribers s ON q.subscriber_id = s.id 
+                                         WHERE q.id = ? LIMIT 1");
+                $stmtItem->execute([$newQueueId]);
+                $item = $stmtItem->fetch();
+                // We break after the first matching flow for a priority trigger, as it's assumed to be the immediate response.
+                break; 
+            }
+        }
+    } else {
+        $logs[] = "[Priority] No valid priority trigger parameters or queue ID received. Exiting.";
+        $pdo->commit(); exit;
+    }
+
+    if (!$item) {
+        $logs[] = "[Priority] No item found for processing. Exiting.";
+        $pdo->commit(); exit;
+    }
+
+    // --- START IMMEDIATE CHAIN EXECUTION FOR THE PRIORITY ITEM ---
+    $subscriberId = $item['subscriber_id'];
+    $flowId = $item['flow_id'];
+    $flowName = $item['flow_name'];
+    $queueId = $item['queue_id'];
+    $flowSteps = json_decode($item['flow_steps'], true);
+    $fConfig = json_decode($item['flow_config'], true) ?: [];
+    
+    $currentStepId = $item['step_id'];
+    $stepsProcessedInRun = 0;
+    $MAX_STEPS = 10; // Safety limit per run for chaining
+    $shouldContinueChain = true;
+
+    $logs[] = "[Priority-Chain] Starting immediate chain for Subscriber {$subscriberId} (Queue ID: {$queueId}) in Flow '{$flowName}'.";
+
+    while ($shouldContinueChain && $stepsProcessedInRun < $MAX_STEPS) {
+        $stepsProcessedInRun++;
+        $currentStep = null;
+        foreach ($flowSteps as $s) if ($s['id'] === $currentStepId) $currentStep = $s;
+
+        if (!$currentStep) {
+            $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed', updated_at = NOW() WHERE id = ?")->execute([$queueId]);
+            $logs[] = "  -> Step '{$currentStepId}' not found. Flow completed for Subscriber {$subscriberId}.";
+            $shouldContinueChain = false;
+            break;
+        }
+
+        // --- CHECK EXIT CONDITIONS (Simplified for instant chain) ---
+        if ($item['sub_status'] !== 'active') {
+            $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed', updated_at = NOW() WHERE id = ?")->execute([$queueId]);
+            logActivity($pdo, $subscriberId, 'exit_flow', $flowId, $flowName, 'Inactive status', $flowId); // FIX: Pass flow_id
+            $logs[] = "  -> Subscriber {$subscriberId} exited flow due to inactive status.";
+            $shouldContinueChain = false; break;
+        }
+        
+        // No complex exit conditions check here for performance, let worker_flow.php handle them on reschedules.
+
+        // --- RÀNG BUỘC THỜI GIAN & TẦN SUẤT: BYPASSED FOR PRIORITY CHAIN ---
+        // Priority chain means these are instant steps, so we don't apply time/frequency constraints.
+        $logs[] = "  -> Executing Step '{$currentStep['label']}' ({$currentStep['type']}). Time/Freq constraints BYPASSED (Priority Chain).";
+
+        $nextStepId = null; 
+        $nextScheduledAt = $now; 
+        $isInstantStep = false; // Flag to determine if next step should be processed immediately in this chain
+
+        switch ($currentStep['type']) {
+            case 'action': // Send Email
+                $config = $currentStep['config'];
+                $contextData = []; 
+                $htmlContent = resolveEmailContent($pdo, $config['templateId'] ?? '', $config['customHtml'] ?? '', $config['contentBody'] ?? '', $contextData);
+                
+                $subscriberData = [
+                    'email' => $item['sub_email'], 'first_name' => $item['first_name'], 'last_name' => $item['last_name'], 'phone_number' => $item['phone_number'], 'company_name' => $item['company_name'], 'job_title' => $item['job_title'], 'date_of_birth' => $item['date_of_birth'], 'anniversary_date' => $item['anniversary_date']
+                ];
+                $finalHtml = replaceMergeTags($htmlContent, $subscriberData, $contextData);
+                $finalSubject = replaceMergeTags($config['subject'] ?? '', $subscriberData, $contextData);
+
+                $attachments = [];
+                $emailAttachments = json_decode($config['attachments'] ?? '[]', true); 
+                if (!empty($emailAttachments)) {
+                    foreach ($emailAttachments as $att) {
+                        if ($att['logic'] === 'all') {
+                            $attachments[] = ['path' => $att['path'], 'name' => $att['name']];
+                        } else if ($att['logic'] === 'match_email') {
+                            if (strpos(strtolower($att['name']), strtolower($item['sub_email'])) !== false) {
+                                $attachments[] = ['path' => $att['path'], 'name' => $att['name']];
+                            }
+                        }
+                    }
+                }
+
+                $res = $mailer->send($item['sub_email'], $finalSubject, $finalHtml, $subscriberId, null, $flowId, $flowName, $attachments);
+                
+                if ($res === true) {
+                    $pdo->prepare("UPDATE flows SET stat_total_sent = stat_total_sent + 1 WHERE id = ?")->execute([$flowId]);
+                    $pdo->prepare("UPDATE subscribers SET stats_sent = stats_sent + 1 WHERE id = ?")->execute([$subscriberId]);
+                    logActivity($pdo, $subscriberId, 'receive_email', $flowId, $flowName, "Sent: " . $currentStep['label'], $flowId); // FIX: Pass flow_id
+                    $logs[] = "  -> Email sent for {$item['sub_email']} for step '{$currentStep['label']}'.";
+                } else {
+                     $logs[] = "  -> Failed to send email for {$item['sub_email']} for step '{$currentStep['label']}': " . (is_string($res) ? $res : 'Unknown Error');
+                }
+                $nextStepId = $currentStep['nextStepId'] ?? null;
+                $isInstantStep = true; 
+                break;
+
+            case 'wait': // Wait steps always break the chain
+                $dur = (int)($currentStep['config']['duration'] ?? 1);
+                $unit = $currentStep['config']['unit'] ?? 'hours';
+                $dt = new DateTime($now); $dt->modify("+$dur $unit");
+                $nextScheduledAt = $dt->format('Y-m-d H:i:s');
+                $nextStepId = $currentStep['nextStepId'] ?? null;
+                
+                $pdo->prepare("UPDATE subscriber_flow_states SET status = 'waiting', scheduled_at = ?, step_id = ?, updated_at = NOW() WHERE id = ?")
+                    ->execute([$nextScheduledAt, $nextStepId, $queueId]);
+                
+                $logs[] = "  -> Step '{$currentStep['label']}' is WAIT. Pausing chain. Next scheduled for {$nextScheduledAt}.";
+                $shouldContinueChain = false; 
+                break;
+            
+            case 'condition': // Conditions can break chain if not immediately met/timed out
+                $condType = $currentStep['config']['conditionType'] ?? 'opened';
+                $waitDur = (int)($currentStep['config']['waitDuration'] ?? 1); 
+                $waitUnit = $currentStep['config']['waitUnit'] ?? 'hours';
+                
+                $timeout = new DateTime($item['queue_created_at']); 
+                $timeout->modify("+$waitDur $waitUnit");
+                $isTimedOut = new DateTime($now) > $timeout;
+
+                $isMatched = false;
+                
+                if ($condType === 'clicked') {
+                    $linkTargets = $currentStep['config']['linkTargets'] ?? [];
+                    if (!is_array($linkTargets) && !empty($currentStep['config']['linkTarget'])) {
+                        $linkTargets = [$currentStep['config']['linkTarget']];
+                    }
+                    
+                    $stmtAct = $pdo->prepare("SELECT details FROM subscriber_activity WHERE subscriber_id = ? AND reference_id = ? AND type = 'click_link' AND created_at >= ?");
+                    $stmtAct->execute([$subscriberId, $flowId, $item['queue_created_at']]);
+                    $clicks = $stmtAct->fetchAll(PDO::FETCH_COLUMN);
+                    
+                    if (count($clicks) > 0) {
+                        if (empty($linkTargets)) {
+                            $isMatched = true; 
+                            $logs[] = "  -> Subscriber {$subscriberId} clicked ANY link for step '{$currentStep['label']}'.";
+                        } else {
+                            foreach ($clicks as $detail) {
+                                $url = str_replace("Click link: ", "", $detail); 
+                                if (in_array($url, $linkTargets)) {
+                                    $isMatched = true;
+                                    $logs[] = "  -> Subscriber {$subscriberId} clicked targeted link '{$url}' for step '{$currentStep['label']}'.";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    $actType = '';
+                    if ($condType === 'replied') $actType = 'reply_email';
+                    else if ($condType === 'unsubscribed') $actType = 'unsubscribe';
+                    else if ($condType === 'opened') $actType = 'open_email';
+                    else if ($condType === 'delivered') $actType = 'receive_email';
+                    
+                    if (!empty($actType)) {
+                        $stmtAct = $pdo->prepare("SELECT id FROM subscriber_activity WHERE subscriber_id = ? AND reference_id = ? AND type = ? AND created_at >= ? LIMIT 1");
+                        $stmtAct->execute([$subscriberId, $flowId, $actType, $item['queue_created_at']]);
+                        if ($stmtAct->fetch()) {
+                            $isMatched = true;
+                            $logs[] = "  -> Subscriber {$subscriberId} performed '{$actType}' for step '{$currentStep['label']}'.";
+                        }
+                    }
+                }
+
+                if ($isMatched) {
+                    $nextStepId = $currentStep['yesStepId'] ?? null;
+                    $logs[] = "  -> Subscriber {$subscriberId} for step '{$currentStep['label']}' matched condition. Moving to 'YES' path.";
+                } elseif ($isTimedOut) {
+                    $nextStepId = $currentStep['noStepId'] ?? null;
+                    $logs[] = "  -> Subscriber {$subscriberId} for step '{$currentStep['label']}' timed out. Moving to 'NO' path.";
+                } else {
+                    $nextScheduledAt = date('Y-m-d H:i:s', strtotime('+5 minutes')); 
+                    $pdo->prepare("UPDATE subscriber_flow_states SET status = 'waiting', scheduled_at = ?, step_id = ?, updated_at = NOW() WHERE id = ?")
+                        ->execute([$nextScheduledAt, $currentStepId, $queueId]);
+                    $logs[] = "  -> Step '{$currentStep['label']}' still waiting for condition. Rescheduled for {$nextScheduledAt}.";
+                    $shouldContinueChain = false; break;
+                }
+                $isInstantStep = true;
+                break;
+
+            case 'update_tag':
+                $existingTags = json_decode($item['sub_tags'] ?? '[]', true); 
+                $tagsToApply = $currentStep['config']['tags'] ?? [];
+                $action = $currentStep['config']['action'] ?? 'add';
+                
+                $newTags = [];
+                if ($action === 'remove') {
+                    $newTags = array_values(array_diff($existingTags, $tagsToApply)); 
+                } else { 
+                    $newTags = array_unique(array_merge($existingTags, $tagsToApply));
+                }
+                    
+                $pdo->prepare("UPDATE subscribers SET tags = ? WHERE id = ?")->execute([json_encode($newTags), $subscriberId]);
+                $item['sub_tags'] = json_encode($newTags); 
+                $nextStepId = $currentStep['nextStepId'] ?? null;
+                $isInstantStep = true;
+                break;
+
+            case 'list_action':
+                $lid = (string)($currentStep['config']['listId'] ?? ''); // Ensure listId is string
+                $lAction = $currentStep['config']['action'] ?? 'add';
+                if ($lid) {
+                    if ($lAction === 'add') {
+                        $pdo->prepare("INSERT IGNORE INTO subscriber_lists (subscriber_id, list_id) VALUES (?, ?)")->execute([$subscriberId, $lid]);
+                        $pdo->prepare("UPDATE lists SET subscriber_count = (SELECT COUNT(*) FROM subscriber_lists WHERE list_id = ?) WHERE id = ?")
+                             ->execute([$lid, $lid]); // Recalculate count
+                    } else { 
+                        $pdo->prepare("DELETE FROM subscriber_lists WHERE subscriber_id = ? AND list_id = ?")->execute([$subscriberId, $lid]);
+                        $pdo->prepare("UPDATE lists SET subscriber_count = GREATEST(0, (SELECT COUNT(*) FROM subscriber_lists WHERE list_id = ?)) WHERE id = ?")
+                             ->execute([$lid, $lid]); // Recalculate count, ensuring it's not negative
+                    }
+                    logActivity($pdo, $subscriberId, 'list_action', $lid, 'List Action', "Action: $lAction on list " . ($lid ? "List ID $lid" : "Unknown"), $flowId); // FIX: Pass flow_id, add list ID to details
+                    $logs[] = "  -> Subscriber {$subscriberId}: {$lAction} from list '{$lid}' for step '{$currentStep['label']}'.";
+                }
+                $nextStepId = $currentStep['nextStepId'] ?? null;
+                $isInstantStep = true;
+                break;
+
+            case 'split_test':
+                $ratioA = (int)($currentStep['config']['ratioA'] ?? 50);
+                $nextStepId = (rand(1, 100) <= $ratioA) ? ($currentStep['pathAStepId'] ?? null) : ($currentStep['pathBStepId'] ?? null); 
+                $logs[] = "  -> Subscriber {$subscriberId}: Split test for step '{$currentStep['label']}' - picked path " . (rand(1,100) <= $ratioA ? 'A' : 'B') . ".";
+                $isInstantStep = true;
+                break;
+            
+            case 'link_flow':
+                if (!empty($currentStep['config']['linkedFlowId'])) {
+                    $pastTime = date('Y-m-d H:i:s', strtotime('-1 second')); 
+                    $pdo->prepare("INSERT INTO subscriber_flow_states (subscriber_id, flow_id, step_id, scheduled_at, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'waiting', NOW(), NOW())")
+                        ->execute([$subscriberId, (string)$currentStep['config']['linkedFlowId'], 'trigger', $pastTime]); // Ensure linkedFlowId is string
+                    
+                    // Get linked flow name for details
+                    $stmtLinkedFlowName = $pdo->prepare("SELECT name FROM flows WHERE id = ?");
+                    $stmtLinkedFlowName->execute([$currentStep['config']['linkedFlowId']]);
+                    $linkedFlowName = $stmtLinkedFlowName->fetchColumn();
+
+                    logActivity($pdo, $subscriberId, 'enter_flow', $currentStep['config']['linkedFlowId'], 'Linked Flow', "Linked from {$flowName} to Flow: " . ($linkedFlowName ?: $currentStep['config']['linkedFlowId']), $currentStep['config']['linkedFlowId']); // FIX: Pass flow_id of linked flow, improve details
+                    $logs[] = "  -> Subscriber {$subscriberId}: Linked to flow '{$currentStep['config']['linkedFlowId']}' from step '{$currentStep['label']}'.";
+                }
+                $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed', updated_at = NOW() WHERE id = ?")->execute([$queueId]);
+                $logs[] = "  -> Flow {$flowId} completed for Subscriber {$subscriberId} due to link_flow.";
+                $shouldContinueChain = false; // Fix: use shouldContinueChain
+                break;
+
+            case 'remove_action':
+                if ($currentStep['config']['actionType'] === 'unsubscribe') {
+                    $pdo->prepare("UPDATE subscribers SET status = 'unsubscribed' WHERE id = ?")->execute([$subscriberId]);
+                    logActivity($pdo, $subscriberId, 'unsubscribe', $flowId, $flowName, 'Unsubscribed via flow', $flowId); // FIX: Pass flow_id
+                    $logs[] = "  -> Subscriber {$subscriberId}: Unsubscribed via step '{$currentStep['label']}'.";
+                }
+                else if ($currentStep['config']['actionType'] === 'delete_contact') {
+                    // Reduce list counts first
+                    $stmtLists = $pdo->prepare("SELECT list_id FROM subscriber_lists WHERE subscriber_id = ?");
+                    $stmtLists->execute([$subscriberId]);
+                    $listIds = $stmtLists->fetchAll(PDO::FETCH_COLUMN);
+                    foreach($listIds as $lid) {
+                        $pdo->prepare("UPDATE lists SET subscriber_count = GREATEST(0, (SELECT COUNT(*) FROM subscriber_lists WHERE list_id = ?)) WHERE id = ?")
+                             ->execute([$lid, $lid]); // Recalculate count, ensuring it's not negative
+                    }
+                    $pdo->prepare("DELETE FROM subscribers WHERE id = ?")->execute([$subscriberId]);
+                    logActivity($pdo, $subscriberId, 'delete_contact', $flowId, $flowName, 'Deleted via flow', $flowId); // FIX: Pass flow_id
+                    $logs[] = "  -> Subscriber {$subscriberId}: Deleted via step '{$currentStep['label']}'.";
+                }
+                $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed', updated_at = NOW() WHERE id = ?")->execute([$queueId]);
+                $logs[] = "  -> Flow {$flowId} completed for Subscriber {$subscriberId} due to remove_action.";
+                $shouldContinueChain = false; // Fix: use shouldContinueChain
+                break;
+
+            default: 
+                $nextStepId = $currentStep['nextStepId'] ?? null; 
+                $logs[] = "  -> Executed unknown step type '{$currentStep['type']}' for '{$currentStep['label']}'.";
+                $isInstantStep = true;
+                break;
+        }
+
+        if ($shouldContinueChain) { // Fix: use shouldContinueChain
+            if ($nextStepId) {
+                if ($isInstantStep) {
+                    $currentStepId = $nextStepId;
+                    $logs[] = "  -> Step finished. Chaining to next step: $currentStepId";
+                    // No DB update here, status remains 'processing' for fast-chaining within this worker run.
+                } else {
+                    // This branch is hit by 'wait' or 'condition' if they scheduled for future and set shouldContinueChain=false
+                    // DB update for 'waiting' state already handled inside 'wait'/'condition' blocks.
+                    $shouldContinueChain = false; 
+                }
+            } else { // No nextStepId, flow completed
+                $pdo->prepare("UPDATE subscriber_flow_states SET status = 'completed', updated_at = NOW() WHERE id = ?")->execute([$queueId]);
+                $pdo->prepare("UPDATE flows SET stat_completed = stat_completed + 1 WHERE id = ?")->execute([$flowId]);
+                logActivity($pdo, $subscriberId, 'complete_flow', $flowId, $flowName, 'Flow finished successfully', $flowId); // FIX: Improve details
+                $logs[] = "  -> End of flow reached. Flow completed for Subscriber {$subscriberId}.";
+                $shouldContinueChain = false;
+            }
+        }
+    } // End of while ($shouldContinueChain && $stepsProcessedInRun < $MAX_STEPS)
+
+    $pdo->commit(); // Commit all changes at the end of the priority run
+
+} catch (Exception $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    $logs[] = "[ERROR] An exception occurred: " . $e->getMessage() . " on line " . $e->getLine() . " in " . $e->getFile();
+}
+
+// Add log to file for debugging
+file_put_contents(__DIR__ . '/worker_priority.log', implode("\n", $logs) . "\n", FILE_APPEND);
+echo implode("\n", $logs);
+?>

@@ -1,0 +1,163 @@
+
+<?php
+/**
+ * MailFlow Pro - Mailer Component
+ * Hỗ trợ: Brevo API (Không cần thư viện), SMTP (Cần PHPMailer), PHP Mail
+ */
+
+class Mailer {
+    private $pdo;
+    private $baseUrl;
+    private $defaultSender;
+    private $smtpSettings = null;
+
+    public function __construct($pdo, $baseUrl, $defaultSender = 'noreply@yourdomain.com') {
+        $this->pdo = $pdo;
+        $this->baseUrl = rtrim($baseUrl, '/');
+        $this->defaultSender = $defaultSender;
+        $this->loadSettings();
+    }
+
+    private function loadSettings() {
+        $stmt = $this->pdo->query("SELECT * FROM system_settings");
+        $this->smtpSettings = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $this->smtpSettings[$row['key']] = $row['value'];
+        }
+    }
+
+    public function send($toEmail, $subject, $htmlContent, $subscriberId, $campaignId = null, $flowId = null) {
+        $trackedHtml = $this->injectTracking($htmlContent, $campaignId, $flowId, $subscriberId);
+        
+        // Brevo yêu cầu sender đã verify.
+        $fromEmail = (filter_var($this->smtpSettings['smtp_user'], FILTER_VALIDATE_EMAIL)) 
+                     ? $this->smtpSettings['smtp_user'] 
+                     : $this->defaultSender;
+        $fromName = "MailFlow Pro";
+
+        $success = false;
+        $error = "";
+
+        if ($this->smtpSettings['smtp_enabled'] === '1') {
+            // TỰ ĐỘNG DÙNG API NẾU LÀ BREVO
+            $host = strtolower($this->smtpSettings['smtp_host'] ?? '');
+            if (strpos($host, 'brevo') !== false || strpos($host, 'sendinblue') !== false) {
+                $success = $this->sendViaBrevoAPI($toEmail, $subject, $trackedHtml, $fromEmail, $fromName, $error);
+            } else {
+                $success = $this->sendViaPHPMailer($toEmail, $subject, $trackedHtml, $fromEmail, $fromName, $error);
+            }
+        } else {
+            $headers = array(
+                'MIME-Version: 1.0',
+                'Content-type: text/html; charset=UTF-8',
+                'From: ' . $fromName . ' <' . $fromEmail . '>',
+                'Reply-To: ' . $fromEmail,
+                'X-Mailer: PHP/' . phpversion()
+            );
+            $success = @mail($toEmail, $subject, $trackedHtml, implode("\r\n", $headers), "-f" . $fromEmail);
+            if (!$success) $error = "PHP mail() bị chặn. Hãy bật SMTP/API.";
+        }
+
+        // Lưu log
+        $stmtLog = $this->pdo->prepare("INSERT INTO mail_delivery_logs (recipient, subject, status, error_message, sent_at) VALUES (?, ?, ?, ?, NOW())");
+        $stmtLog->execute([$toEmail, $subject, $success ? 'success' : 'failed', $error]);
+
+        if ($success) {
+            $this->logStats($campaignId, $flowId, $subscriberId);
+        }
+        return $success ? true : $error;
+    }
+
+    private function sendViaBrevoAPI($to, $subject, $body, $fromEmail, $fromName, &$error) {
+        $apiKey = trim($this->smtpSettings['smtp_pass'] ?? ''); 
+        
+        if (empty($apiKey)) {
+            $error = "Chưa nhập API Key trong phần Mật khẩu.";
+            return false;
+        }
+
+        $url = 'https://api.brevo.com/v3/smtp/email';
+        $data = [
+            'sender' => ['name' => $fromName, 'email' => $fromEmail],
+            'to' => [['email' => $to]],
+            'subject' => $subject,
+            'htmlContent' => $body
+        ];
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false); // Bỏ qua SSL check cho hosting yếu
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'api-key: ' . $apiKey,
+            'Content-Type: application/json',
+            'Accept: application/json'
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        if ($httpCode >= 200 && $httpCode < 300) {
+            return true;
+        } else {
+            $resData = json_decode($response, true);
+            $msg = $resData['message'] ?? $curlError ?? 'Unknown Error';
+            if ($httpCode == 401) {
+                $error = "Lỗi 401: API Key không hợp lệ. Bạn đang dùng SMTP Key chứ không phải API Key v3.";
+            } else {
+                $error = "Brevo API ($httpCode): " . $msg;
+            }
+            return false;
+        }
+    }
+
+    private function sendViaPHPMailer($to, $subject, $body, $fromEmail, $fromName, &$error) {
+        $phpMailerPath = __DIR__ . '/PHPMailer/src/PHPMailer.php';
+        if (!file_exists($phpMailerPath)) {
+            $error = "Thiếu thư viện PHPMailer.";
+            return false;
+        }
+        require_once __DIR__ . '/PHPMailer/src/Exception.php';
+        require_once __DIR__ . '/PHPMailer/src/PHPMailer.php';
+        require_once __DIR__ . '/PHPMailer/src/SMTP.php';
+        $mail = new PHPMailer\PHPMailer\PHPMailer(true);
+        try {
+            $mail.isSMTP();
+            $mail->Host = $this->smtpSettings['smtp_host'];
+            $mail->SMTPAuth = true;
+            $mail->Username = $this->smtpSettings['smtp_user'];
+            $mail->Password = $this->smtpSettings['smtp_pass'];
+            $mail->SMTPSecure = ($this->smtpSettings['smtp_port'] == '465') ? 'ssl' : 'tls';
+            $mail->Port = (int)$this->smtpSettings['smtp_port'];
+            $mail->CharSet = 'UTF-8';
+            $mail->SMTPOptions = array('ssl'=>array('verify_peer'=>false,'verify_peer_name'=>false,'allow_self_signed'=>true));
+            $mail->setFrom($fromEmail, $fromName);
+            $mail->addAddress($to);
+            $mail->isHTML(true);
+            $mail->Subject = $subject;
+            $mail->Body = $body;
+            $mail->send();
+            return true;
+        } catch (Exception $e) {
+            $error = "SMTP Error: " . $mail->ErrorInfo;
+            return false;
+        }
+    }
+
+    private function injectTracking($html, $cid, $fid, $sid) {
+        if (!$html) $html = "<html><body></body></html>";
+        $tp = http_build_query(['type' => 'open', 'cid' => $cid ?? '', 'fid' => $fid ?? '', 'sid' => $sid]);
+        $pixel = '<img src="' . $this->baseUrl . "/webhook.php?" . $tp . '" width="1" height="1" style="display:none" />';
+        $html = (strpos($html, '</body>') !== false) ? str_replace('</body>', $pixel . '</body>', $html) : $html . $pixel;
+        return $html;
+    }
+
+    private function logStats($cid, $fid, $sid) {
+        if ($cid) $this->pdo->prepare("UPDATE campaigns SET count_sent = count_sent + 1 WHERE id = ?")->execute([$cid]);
+        if ($sid && $sid !== 'test-user') $this->pdo->prepare("UPDATE subscribers SET stats_sent = stats_sent + 1 WHERE id = ?")->execute([$sid]);
+    }
+}
+?>

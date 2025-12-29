@@ -1,0 +1,133 @@
+<?php
+// api/flows.php - VERSION V26.0 (ACTIVITY LOGGING & FLOW_ID FOR LOGS)
+require_once 'db_connect.php';
+apiHeaders();
+
+// --- ROUTE: Participants ---
+if (isset($_GET['route']) && $_GET['route'] === 'participants') {
+    $flowId = $_GET['id'] ?? null;
+    if (!$flowId) jsonResponse(false, null, 'Flow ID required');
+    $sql = "SELECT s.id, s.email, s.first_name, s.last_name, sfs.step_id, sfs.status, sfs.scheduled_at, sfs.created_at as entered_at 
+            FROM subscriber_flow_states sfs
+            JOIN subscribers s ON sfs.subscriber_id = s.id
+            WHERE sfs.flow_id = ? AND sfs.status IN ('waiting', 'processing')
+            ORDER BY sfs.created_at DESC LIMIT 200";
+    $stmt = $pdo->prepare($sql); $stmt->execute([$flowId]);
+    $data = array_map(function($p) {
+        return [
+            'id' => $p['id'], 'email' => $p['email'],
+            'name' => trim(($p['first_name']??'') . ' ' . ($p['last_name']??'')),
+            'stepId' => $p['step_id'], 'status' => $p['status'],
+            'scheduledAt' => $p['scheduled_at'], 'enteredAt' => $p['entered_at']
+        ];
+    }, $stmt->fetchAll());
+    jsonResponse(true, $data);
+}
+
+// --- ROUTE: History ---
+if (isset($_GET['route']) && $_GET['route'] === 'history') {
+    $flowId = $_GET['id'] ?? null;
+    $campaignId = $_GET['campaign_id'] ?? null; // New param for campaign logs
+    
+    // FIX: Only one of flowId or campaignId should be set. Prioritize flowId if both exist.
+    if (!$flowId && !$campaignId) jsonResponse(false, null, 'Flow ID or Campaign ID required');
+
+    $sql = "SELECT sa.type, sa.details, sa.created_at, s.email, s.first_name, s.last_name, sa.reference_name as label 
+            FROM subscriber_activity sa
+            LEFT JOIN subscribers s ON sa.subscriber_id = s.id
+            WHERE ";
+    $params = [];
+    
+    // FIX: Use sa.flow_id and sa.campaign_id for filtering
+    if ($flowId) {
+        $sql .= "sa.flow_id = ?";
+        $params[] = $flowId;
+    } else { // Only if flowId is not set, use campaignId
+        $sql .= "sa.campaign_id = ?";
+        $params[] = $campaignId;
+    }
+    
+    $sql .= " ORDER BY sa.created_at DESC LIMIT 100";
+    $stmt = $pdo->prepare($sql); $stmt->execute($params);
+    jsonResponse(true, $stmt->fetchAll());
+}
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+
+function formatFlow($row) {
+    $steps = json_decode($row['steps'] ?? '[]');
+    $row['steps'] = is_array($steps) ? $steps : []; // Ensure array
+    
+    $row['config'] = json_decode($row['config'] ?? '{}');
+    $row['stats'] = [
+        'enrolled' => (int)$row['stat_enrolled'],
+        'completed' => (int)$row['stat_completed'],
+        'openRate' => (float)$row['stat_open_rate'],
+        'clickRate' => (float)$row['stat_click_rate'],
+        'totalSent' => (int)($row['stat_total_sent'] ?? 0),
+        'totalOpened' => (int)($row['stat_total_opened'] ?? 0),
+    ];
+    $row['createdAt'] = $row['created_at'];
+    $row['archivedAt'] = $row['archived_at'];
+    unset($row['stat_enrolled'], $row['stat_completed'], $row['stat_open_rate'], $row['stat_click_rate'], $row['stat_total_sent'], $row['stat_total_opened'], $row['created_at'], $row['archived_at']);
+    return $row;
+}
+
+switch ($method) {
+    case 'GET':
+        if ($path) {
+            $stmt = $pdo->prepare("SELECT * FROM flows WHERE id = ?");
+            $stmt->execute([$path]);
+            $flow = $stmt->fetch();
+            $flow ? jsonResponse(true, formatFlow($flow)) : jsonResponse(false, null, 'Not found');
+        } else {
+            $stmt = $pdo->query("SELECT * FROM flows ORDER BY created_at DESC");
+            jsonResponse(true, array_map('formatFlow', $stmt->fetchAll()));
+        }
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $id = $data['id'] ?? uniqid();
+        $steps = json_encode($data['steps'] ?? []);
+        $config = json_encode($data['config'] ?? (object)[]);
+        $sql = "INSERT INTO flows (id, name, description, status, steps, config, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())";
+        $pdo->prepare($sql)->execute([$id, $data['name'], $data['description'], $data['status'], $steps, $config]);
+        jsonResponse(true, ['id' => $id]);
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        $steps = json_encode($data['steps'] ?? []);
+        $config = json_encode($data['config'] ?? (object)[]);
+        $stats = $data['stats'] ?? [];
+        
+        $sql = "UPDATE flows SET 
+                name=?, description=?, status=?, steps=?, config=?, 
+                stat_enrolled=?, stat_completed=?, stat_open_rate=?, stat_click_rate=?, 
+                stat_total_sent=?, stat_total_opened=?,
+                archived_at=? 
+                WHERE id=?";
+        
+        $pdo->prepare($sql)->execute([
+            $data['name'], $data['description'], $data['status'], $steps, $config,
+            (int)($stats['enrolled'] ?? 0), 
+            (int)($stats['completed'] ?? 0), 
+            (float)($stats['openRate'] ?? 0), 
+            (float)($stats['clickRate'] ?? 0),
+            (int)($stats['totalSent'] ?? 0),
+            (int)($stats['totalOpened'] ?? 0),
+            $data['archivedAt'] ?? null,
+            $path
+        ]);
+        jsonResponse(true, $data);
+        break;
+
+    case 'DELETE':
+        $pdo->prepare("DELETE FROM flows WHERE id = ?")->execute([$path]);
+        jsonResponse(true, ['id' => $path]);
+        break;
+}
+?>

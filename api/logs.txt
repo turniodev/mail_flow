@@ -1,0 +1,23 @@
+<?php
+require_once 'db_connect.php';
+apiHeaders();
+
+$type = $_GET['type'] ?? 'worker_flow'; // Default to worker_flow for general log
+
+$logFile = __DIR__ . '/' . $type . '.log'; // Construct log file path
+
+if (file_exists($logFile)) {
+    $content = file_get_contents($logFile);
+    // Limit log size for large files
+    if (strlen($content) > 50000) $content = "...\n" . substr($content, -50000);
+    jsonResponse(true, ['content' => $content]);
+} else {
+    // Check if it's a delivery log request, which is from DB
+    if ($type === 'delivery') {
+        $stmt = $pdo->query("SELECT * FROM mail_delivery_logs ORDER BY sent_at DESC LIMIT 50");
+        jsonResponse(true, $stmt->fetchAll());
+    } else {
+        jsonResponse(true, ['content' => ucfirst(str_replace('_', ' ', $type)) . ' log file not found.']);
+    }
+}
+?>

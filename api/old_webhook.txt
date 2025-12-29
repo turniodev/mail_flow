@@ -1,0 +1,87 @@
+
+<?php
+// api/webhook.php - Tracking Pixel & Link Redirect (Unique Logic)
+require_once 'db_connect.php';
+
+// Lấy tham số từ URL
+$type = $_GET['type'] ?? ''; // 'open' hoặc 'click'
+$cid = $_GET['cid'] ?? null; // Campaign ID
+$fid = $_GET['fid'] ?? null; // Flow ID
+$sid = $_GET['sid'] ?? null; // Subscriber ID
+$urlEncoded = $_GET['url'] ?? '';
+
+// Hàm hỗ trợ ghi log activity (Chỉ ghi nếu chưa tồn tại - Unique Check)
+function logUniqueActivity($pdo, $sid, $actionType, $refId, $refName, $details = '') {
+    // Kiểm tra xem đã có log này chưa
+    $stmtCheck = $pdo->prepare("SELECT id FROM subscriber_activity WHERE subscriber_id = ? AND type = ? AND reference_id = ? LIMIT 1");
+    $stmtCheck->execute([$sid, $actionType, $refId]);
+    
+    if (!$stmtCheck->fetch()) {
+        // Nếu chưa có -> Insert
+        $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+        $stmtIns->execute([$sid, $actionType, $refId, $refName, $details]);
+        return true; // Đánh dấu là hành động mới (Unique)
+    }
+    return false; // Đã tồn tại (Duplicate)
+}
+
+if ($sid) {
+    // 1. XỬ LÝ SỰ KIỆN OPEN
+    if ($type === 'open') {
+        // Xác định Ref ID và Name
+        $refId = $cid ?: ($fid ?: 'unknown');
+        $refName = $cid ? "Campaign" : ($fid ? "Flow Email" : "Direct Email"); 
+
+        // Chỉ tăng đếm nếu đây là lần mở đầu tiên (Unique Open)
+        $isUnique = logUniqueActivity($pdo, $sid, 'open_email', $refId, $refName, "Đã mở email lần đầu");
+
+        if ($isUnique) {
+            // Cập nhật Subscriber (Tổng quan)
+            $pdo->prepare("UPDATE subscribers SET stats_opened = stats_opened + 1, last_open_at = NOW() WHERE id = ?")->execute([$sid]);
+            
+            // Cập nhật Campaign Stats
+            if ($cid) {
+                $pdo->prepare("UPDATE campaigns SET count_opened = count_opened + 1 WHERE id = ?")->execute([$cid]);
+            }
+            // Cập nhật Flow Stats (FIXED: update stat_total_opened)
+            if ($fid) {
+                $pdo->prepare("UPDATE flows SET stat_total_opened = stat_total_opened + 1 WHERE id = ?")->execute([$fid]);
+            }
+        }
+
+        // Luôn trả về ảnh GIF trong suốt 1x1px (kể cả mở lại)
+        header('Content-Type: image/gif');
+        echo base64_decode('R0lGODlhAQABAJAAAP8AAAAAACH5BAUQAAAALAAAAAABAAEAAAICBAEAOw==');
+        exit;
+    }
+
+    // 2. XỬ LÝ SỰ KIỆN CLICK
+    if ($type === 'click') {
+        $targetUrl = base64_decode($urlEncoded);
+        $refId = $cid ?: ($fid ?: 'unknown');
+        
+        // Click cũng check unique per link? Thường click check unique per email
+        // Ở đây ta check unique click cho chiến dịch này
+        $isUnique = logUniqueActivity($pdo, $sid, 'click_link', $refId, "Click Link", $targetUrl);
+
+        if ($isUnique) {
+            $pdo->prepare("UPDATE subscribers SET stats_clicked = stats_clicked + 1, last_click_at = NOW() WHERE id = ?")->execute([$sid]);
+            
+            if ($cid) {
+                $pdo->prepare("UPDATE campaigns SET count_clicked = count_clicked + 1 WHERE id = ?")->execute([$cid]);
+            }
+            if ($fid) {
+                $pdo->prepare("UPDATE flows SET stat_click_rate = stat_click_rate + 1 WHERE id = ?")->execute([$fid]);
+            }
+        }
+
+        // Chuyển hướng
+        if ($targetUrl) {
+            header("Location: $targetUrl");
+            exit;
+        }
+    }
+}
+
+echo "MailFlow Tracking Service";
+?>

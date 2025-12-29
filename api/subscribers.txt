@@ -1,0 +1,267 @@
+<?php
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+$route = isset($_GET['route']) ? $_GET['route'] : null;
+
+function formatSubscriber($row) {
+    // FIX: Ensure 'tags' is always an array of strings.
+    $tagsData = json_decode($row['tags'] ?? '[]', true);
+    $row['tags'] = is_array($tagsData) ? array_values(array_map('strval', $tagsData)) : [];
+    
+    $row['customAttributes'] = json_decode($row['custom_attributes'] ?? '{}'); // FIX: Changed key to camelCase
+    
+    // FIX: Keep first_name and last_name separate for proper UI editing
+    $row['firstName'] = $row['first_name'] ?? '';
+    $row['lastName'] = $row['last_name'] ?? ''; 
+    
+    $row['gender'] = $row['gender'] ?? '';
+    $row['joinedAt'] = $row['joined_at'] ?? date('Y-m-d H:i:s');
+    $row['phoneNumber'] = $row['phone_number'] ?? '';
+    $row['jobTitle'] = $row['job_title'] ?? '';
+    $row['companyName'] = $row['company_name'] ?? '';
+    $row['country'] = $row['country'] ?? '';
+    $row['city'] = $row['city'] ?? '';
+    $row['source'] = $row['source'] ?? 'Manual'; // FIX: Add source
+    $row['dateOfBirth'] = $row['date_of_birth'] ?? null;
+    $row['anniversaryDate'] = $row['anniversary_date'] ?? null;
+    $row['notes'] = json_decode($row['notes'] ?? '[]'); // Load notes
+
+    $row['stats'] = [
+        'emailsSent' => (int)($row['stats_sent'] ?? 0),
+        'emailsOpened' => (int)($row['stats_opened'] ?? 0),
+        'linksClicked' => (int)($row['stats_clicked'] ?? 0),
+        'lastOpenAt' => $row['last_open_at'] ?? null,
+        'lastClickAt' => $row['last_click_at'] ?? null
+    ];
+
+    unset($row['first_name'], $row['last_name'], $row['joined_at'], $row['phone_number'], $row['job_title'], $row['company_name'], $row['custom_attributes'], $row['gender'], $row['date_of_birth'], $row['anniversary_date'], $row['source']);
+    unset($row['stats_sent'], $row['stats_opened'], $row['stats_clicked'], $row['last_open_at'], $row['last_click_at']);
+    return $row;
+}
+
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    if ($stmtCount->fetchColumn() > 10) {
+        $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1")->execute([$subscriberId]);
+    }
+}
+
+
+// --- ROUTE: BULK IMPORT ---
+if ($method === 'POST' && $route === 'subscribers_bulk') {
+    $list = json_decode(file_get_contents("php://input"), true);
+    if (!is_array($list)) {
+        jsonResponse(false, null, 'Invalid data format. Expected an array.');
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $sql = "INSERT INTO subscribers (id, email, first_name, last_name, tags, status, source, joined_at, notes) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), '[]')
+                ON DUPLICATE KEY UPDATE first_name = VALUES(first_name), tags = VALUES(tags), status = VALUES(status), source = VALUES(source)"; // FIX: Also update source on duplicate
+        $stmtSub = $pdo->prepare($sql);
+        
+        $sqlList = "INSERT IGNORE INTO subscriber_lists (subscriber_id, list_id) VALUES (?, ?)";
+        $stmtList = $pdo->prepare($sqlList);
+
+        $processedIds = [];
+        $affectedListIds = [];
+
+        foreach ($list as $data) {
+            $id = $data['id'] ?? uniqid();
+            $tags = json_encode($data['tags'] ?? []);
+            
+            $stmtSub->execute([
+                $id, 
+                $data['email'], 
+                $data['firstName'] ?? '', 
+                $data['lastName'] ?? '', // FIX: Use lastName from data
+                $tags, 
+                $data['status'] ?? 'active', 
+                $data['source'] ?? 'Bulk Import'
+            ]);
+
+            // Liên kết với danh sách
+            if (!empty($data['listIds'])) {
+                foreach ($data['listIds'] as $lid) {
+                    $stmtList->execute([$id, $lid]);
+                    $affectedListIds[] = $lid;
+                }
+            }
+            $processedIds[] = $id;
+        }
+
+        // Cập nhật lại subscriber_count cho các list bị ảnh hưởng
+        if (!empty($affectedListIds)) {
+            $uniqueLists = array_unique($affectedListIds);
+            foreach ($uniqueLists as $lid) {
+                $pdo->prepare("UPDATE lists SET subscriber_count = (SELECT COUNT(*) FROM subscriber_lists WHERE list_id = ?) WHERE id = ?")
+                    ->execute([$lid, $lid]);
+            }
+        }
+
+        $pdo->commit();
+        jsonResponse(true, ['count' => count($processedIds)], 'Import thành công');
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        jsonResponse(false, null, $e->getMessage());
+    }
+}
+
+// --- CHU TRÌNH CRUD THÔNG THƯỜNG ---
+switch ($method) {
+    case 'GET':
+        if ($path) {
+            $stmt = $pdo->prepare("SELECT * FROM subscribers WHERE id = ?");
+            $stmt->execute([$path]);
+            $sub = $stmt->fetch();
+            if ($sub) {
+                $sub = formatSubscriber($sub);
+                
+                // Get Lists
+                $stmtLists = $pdo->prepare("SELECT list_id FROM subscriber_lists WHERE subscriber_id = ?");
+                $stmtLists->execute([$path]);
+                $sub['listIds'] = $stmtLists->fetchAll(PDO::FETCH_COLUMN);
+                
+                // Get Notes (already loaded via formatSubscriber)
+                // $stmtNotes = $pdo->prepare("SELECT id, content, created_by as createdBy, created_at as createdAt FROM subscriber_notes WHERE subscriber_id = ? ORDER BY created_at DESC");
+                // $stmtNotes->execute([$path]);
+                // $sub['notes'] = $stmtNotes->fetchAll();
+
+                // Get Activity History (limited to 10 entries)
+                // FIX: Lấy thêm flow_id và campaign_id
+                $stmtActs = $pdo->prepare("SELECT type, reference_name, details, created_at, flow_id, campaign_id FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at DESC LIMIT 10");
+                $stmtActs->execute([$path]);
+                $sub['activity'] = $stmtActs->fetchAll();
+
+                jsonResponse(true, $sub);
+            } else { jsonResponse(false, null, 'Not found'); }
+        } else {
+            // Filter by TAG if parameter exists
+            $tagFilter = $_GET['tag'] ?? null;
+            
+            if ($tagFilter) {
+                $sql = "SELECT * FROM subscribers WHERE JSON_CONTAINS(tags, JSON_QUOTE(?)) ORDER BY joined_at DESC LIMIT 5000";
+                $stmt = $pdo->prepare($sql);
+                $stmt->execute([$tagFilter]);
+            } else {
+                $stmt = $pdo->query("SELECT * FROM subscribers ORDER BY joined_at DESC LIMIT 1000");
+            }
+
+            $data = array_map(function($sub) use ($pdo) {
+                $s = formatSubscriber($sub);
+                $stmtL = $pdo->prepare("SELECT list_id FROM subscriber_lists WHERE subscriber_id = ?");
+                $stmtL->execute([$sub['id']]);
+                $s['listIds'] = $stmtL->fetchAll(PDO::FETCH_COLUMN);
+                $s['notes'] = json_decode($sub['notes'] ?? '[]'); // Ensure notes are loaded for list view too
+                return $s;
+            }, $stmt->fetchAll());
+            jsonResponse(true, $data);
+        }
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $id = $data['id'] ?? uniqid();
+        $tags = json_encode($data['tags'] ?? []);
+        $attrs = json_encode($data['customAttributes'] ?? (object)[]);
+        $notes = json_encode($data['notes'] ?? []); // Save notes on POST
+        
+        $sql = "INSERT INTO subscribers (id, email, first_name, last_name, gender, tags, custom_attributes, phone_number, job_title, company_name, country, city, source, joined_at, notes, status) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)"; // FIX: Added status
+        $stmt = $pdo->prepare($sql);
+        try {
+            $stmt->execute([
+                $id, $data['email'], $data['firstName'] ?? '', $data['lastName'] ?? '', $data['gender'] ?? '', $tags, $attrs,
+                $data['phoneNumber'] ?? '', $data['jobTitle'] ?? '', $data['companyName'] ?? '',
+                $data['country'] ?? '', $data['city'] ?? '', $data['source'] ?? 'Manual', $notes, $data['status'] ?? 'active' // FIX: Added status
+            ]);
+            
+            // Xử lý Lists + Log Activity
+            if (!empty($data['listIds'])) {
+                $stmtList = $pdo->prepare("INSERT INTO subscriber_lists (subscriber_id, list_id) VALUES (?, ?)");
+                foreach ($data['listIds'] as $lid) { 
+                    $stmtList->execute([$id, $lid]); 
+                    // Cập nhật count
+                    $pdo->prepare("UPDATE lists SET subscriber_count = subscriber_count + 1 WHERE id = ?")->execute([$lid]);
+                }
+            }
+            $data['id'] = $id;
+            jsonResponse(true, $data);
+        } catch (Exception $e) { jsonResponse(false, null, $e->getMessage()); }
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        $tags = json_encode($data['tags'] ?? []);
+        $attrs = json_encode($data['customAttributes'] ?? (object)[]);
+        $dob = !empty($data['dateOfBirth']) ? $data['dateOfBirth'] : null;
+        $anniversary = !empty($data['anniversaryDate']) ? $data['anniversaryDate'] : null;
+        $notes = json_encode($data['notes'] ?? []); // Save notes on PUT
+
+        $sql = "UPDATE subscribers SET first_name=?, last_name=?, gender=?, tags=?, custom_attributes=?, status=?, 
+                phone_number=?, job_title=?, company_name=?, country=?, city=?, source=?, date_of_birth=?, anniversary_date=?, notes=? 
+                WHERE id=?"; // FIX: Added source to update
+        $stmt = $pdo->prepare($sql);
+        try {
+            $stmt->execute([
+                $data['firstName'] ?? '', $data['lastName'] ?? '', $data['gender'] ?? null, $tags, $attrs, $data['status'], 
+                $data['phoneNumber'] ?? '', $data['jobTitle'] ?? '', $data['companyName'] ?? '',
+                $data['country'] ?? '', $data['city'] ?? '', $data['source'] ?? 'Manual', $dob, $anniversary, $notes, $path
+            ]);
+            
+            // Xử lý thay đổi List
+            if (isset($data['listIds'])) {
+                $oldLists = $pdo->prepare("SELECT list_id FROM subscriber_lists WHERE subscriber_id = ?");
+                $oldLists->execute([$path]);
+                $currentListIds = $oldLists->fetchAll(PDO::FETCH_COLUMN);
+                
+                $newListIds = $data['listIds'];
+                
+                // Xóa cái cũ không còn
+                $toRemove = array_diff($currentListIds, $newListIds);
+                if (!empty($toRemove)) {
+                    foreach ($toRemove as $lid) {
+                        $pdo->prepare("DELETE FROM subscriber_lists WHERE subscriber_id = ? AND list_id = ?")->execute([$path, $lid]);
+                        $pdo->prepare("UPDATE lists SET subscriber_count = GREATEST(0, subscriber_count - 1) WHERE id = ?")->execute([$lid]);
+                    }
+                }
+
+                // Thêm cái mới chưa có
+                $toAdd = array_diff($newListIds, $currentListIds);
+                if (!empty($toAdd)) {
+                    $stmtList = $pdo->prepare("INSERT INTO subscriber_lists (subscriber_id, list_id) VALUES (?, ?)");
+                    foreach ($toAdd as $lid) {
+                        $stmtList->execute([$path, $lid]);
+                        $pdo->prepare("UPDATE lists SET subscriber_count = subscriber_count + 1 WHERE id = ?")->execute([$lid]);
+                    }
+                }
+            }
+            jsonResponse(true, $data);
+        } catch (Exception $e) { jsonResponse(false, null, $e->getMessage()); }
+        break;
+
+    case 'DELETE':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        
+        // Giảm count của các list trước khi xóa
+        $stmtLists = $pdo->prepare("SELECT list_id FROM subscriber_lists WHERE subscriber_id = ?");
+        $stmtLists->execute([$path]);
+        $lids = $stmtLists->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($lids as $lid) {
+            $pdo->prepare("UPDATE lists SET subscriber_count = GREATEST(0, subscriber_count - 1) WHERE id = ?")->execute([$lid]);
+        }
+
+        $pdo->prepare("DELETE FROM subscribers WHERE id = ?")->execute([$path]);
+        jsonResponse(true, ['id' => $path]);
+        break;
+}
+?>

@@ -1,0 +1,103 @@
+<?php
+// api/tags.php - DEEP SYNC LOGIC V2.0
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+
+switch ($method) {
+    case 'GET':
+        $sql = "SELECT t.id, t.name, t.description, 
+                (SELECT COUNT(*) FROM subscribers s 
+                 WHERE JSON_CONTAINS(s.tags, JSON_QUOTE(t.name))) as subscriber_count 
+                FROM tags t 
+                ORDER BY name ASC";
+        $stmt = $pdo->query($sql);
+        jsonResponse(true, $stmt->fetchAll());
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $name = strtoupper(trim($data['name'] ?? ''));
+        $description = trim($data['description'] ?? '');
+        if (!$name) jsonResponse(false, null, 'Tên nhãn không được để trống');
+        
+        $stmt = $pdo->prepare("SELECT id FROM tags WHERE name = ?");
+        $stmt->execute([$name]);
+        if ($stmt->fetch()) jsonResponse(false, null, 'Nhãn này đã tồn tại');
+
+        $id = uniqid();
+        $stmt = $pdo->prepare("INSERT INTO tags (id, name, description) VALUES (?, ?, ?)");
+        $stmt->execute([$id, $name, $description]);
+        jsonResponse(true, ['id' => $id, 'name' => $name, 'description' => $description, 'subscriber_count' => 0]);
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        $newName = strtoupper(trim($data['name'] ?? ''));
+        $newDesc = trim($data['description'] ?? '');
+
+        $pdo->beginTransaction();
+        try {
+            // 1. Lấy thông tin cũ
+            $stmtOld = $pdo->prepare("SELECT name FROM tags WHERE id = ?");
+            $stmtOld->execute([$path]);
+            $oldName = $stmtOld->fetchColumn();
+
+            if (!$oldName) throw new Exception("Không tìm thấy nhãn");
+
+            // 2. Cập nhật bảng tags
+            $stmtUp = $pdo->prepare("UPDATE tags SET name = ?, description = ? WHERE id = ?");
+            $stmtUp->execute([$newName, $newDesc, $path]);
+
+            // 3. Nếu đổi tên -> Cập nhật TOÀN BỘ subscriber
+            if ($oldName !== $newName) {
+                // SQL Logic: Tìm vị trí nhãn cũ trong mảng JSON và thay bằng nhãn mới
+                $updateSubSql = "UPDATE subscribers 
+                                 SET tags = JSON_SET(tags, JSON_UNQUOTE(JSON_SEARCH(tags, 'one', ?)), ?) 
+                                 WHERE JSON_CONTAINS(tags, JSON_QUOTE(?))";
+                $stmtSub = $pdo->prepare($updateSubSql);
+                $stmtSub->execute([$oldName, $newName, $oldName]);
+            }
+
+            $pdo->commit();
+            jsonResponse(true, ['id' => $path, 'name' => $newName], 'Đã cập nhật hệ thống thành công');
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            jsonResponse(false, null, $e->getMessage());
+        }
+        break;
+
+    case 'DELETE':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        
+        $pdo->beginTransaction();
+        try {
+            // 1. Lấy tên nhãn để xóa trong mảng JSON khách hàng
+            $stmtN = $pdo->prepare("SELECT name FROM tags WHERE id = ?");
+            $stmtN->execute([$path]);
+            $tagName = $stmtN->fetchColumn();
+
+            if ($tagName) {
+                // 2. Gỡ nhãn khỏi toàn bộ subscribers
+                $cleanSubSql = "UPDATE subscribers 
+                                SET tags = JSON_REMOVE(tags, JSON_UNQUOTE(JSON_SEARCH(tags, 'one', ?))) 
+                                WHERE JSON_CONTAINS(tags, JSON_QUOTE(?))";
+                $stmtClean = $pdo->prepare($cleanSubSql);
+                $stmtClean->execute([$tagName, $tagName]);
+            }
+
+            // 3. Xóa bản ghi tag
+            $pdo->prepare("DELETE FROM tags WHERE id = ?")->execute([$path]);
+            
+            $pdo->commit();
+            jsonResponse(true, ['id' => $path], 'Đã gỡ nhãn khỏi toàn bộ hệ thống');
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            jsonResponse(false, null, $e->getMessage());
+        }
+        break;
+}
+?>

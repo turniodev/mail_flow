@@ -1,0 +1,228 @@
+<?php
+// api/worker_campaign.php - OMNI-ENGINE V28.1 (CAMPAIGN DISPATCHER WITH FLOW/CAMPAIGN ID LOGGING)
+// This worker is designed to be run by a cron job (e.g., every 5 minutes)
+// to send batches of emails for active campaigns.
+
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE); 
+ini_set('display_errors', 0);
+set_time_limit(300); // Allow up to 5 minutes for sending a batch
+
+require_once 'db_connect.php';
+require_once 'Mailer.php'; // Mailer is required here for sending emails
+
+date_default_timezone_set('Asia/Ho_Chi_Minh');
+$pdo->exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
+
+$apiUrl = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https://" : "http://" . $_SERVER['HTTP_HOST'] . dirname(dirname($_SERVER['PHP_SELF']));
+// Ensure apiUrl is correctly configured from system settings in a real scenario
+$stmt = $pdo->query("SELECT * FROM system_settings");
+$settings = [];
+foreach ($stmt->fetchAll() as $row) { $settings[$row['key']] = $row['value']; }
+$defaultSender = !empty($settings['smtp_user']) ? $settings['smtp_user'] : "marketing@ka-en.com.vn"; 
+$mailer = new Mailer($pdo, $apiUrl, $defaultSender);
+
+$now = date('Y-m-d H:i:s');
+$logs = [];
+$logs[] = "--- CAMPAIGN WORKER START: $now ---";
+
+// =================================================================================
+// HELPER: Parse Dynamic Looping Content (Replicated for self-sufficiency)
+// =================================================================================
+function parseLoopingContent($html, $context) {
+    return preg_replace_callback('/<!-- START_ITEM_LOOP -->(.*?)<!-- END_ITEM_LOOP -->/s', function($matches) use ($context) {
+        $template = $matches[1];
+        $output = '';
+        $items = $context['items'] ?? [];
+        if (is_array($items) && count($items) > 0) {
+            foreach ($items as $item) {
+                $row = $template;
+                foreach ($item as $key => $val) {
+                    $row = str_replace("{{item.$key}}", $val, $row);
+                }
+                $output .= $row;
+            }
+        }
+        return $output;
+    }, $html);
+}
+
+// =================================================================================
+// HELPER: Resolve Email Content & Apply Logic (Replicated for self-sufficiency)
+// =================================================================================
+function resolveEmailContent($pdo, $templateId, $customHtml, $fallbackBody = '', $context = []) {
+    $htmlContent = '';
+    if ($templateId && $templateId !== 'custom-html') {
+        $stmt = $pdo->prepare("SELECT html_content FROM templates WHERE id = ?");
+        $stmt->execute([$templateId]);
+        $htmlContent = $stmt->fetchColumn();
+        if ($htmlContent && $fallbackBody && strpos($htmlContent, '{{body}}') !== false) {
+            $htmlContent = str_replace('{{body}}', $fallbackBody, $htmlContent);
+        }
+    } elseif ($templateId === 'custom-html' || !empty($customHtml)) {
+        $htmlContent = !empty($customHtml) ? $customHtml : $fallbackBody;
+    } else {
+        $htmlContent = $fallbackBody;
+    }
+    if (!$htmlContent) $htmlContent = "<html><body><p>(No Content)</p></body></html>";
+    $htmlContent = parseLoopingContent($htmlContent, $context);
+    return $htmlContent;
+}
+
+// =================================================================================
+// HELPER: Replace Merge Tags (Variables) (Replicated for self-sufficiency)
+// =================================================================================
+function replaceMergeTags($html, $subscriber, $context = []) {
+    $firstName = $subscriber['first_name'] ?? '';
+    $lastName = $subscriber['last_name'] ?? '';
+    $fullName = trim($firstName . ' ' . $lastName);
+    $email = $subscriber['email'] ?? '';
+    
+    $map = [
+        '{{first_name}}' => $firstName,
+        '{{last_name}}' => $lastName,
+        '{{full_name}}' => $fullName ?: 'Bạn',
+        '{{email}}' => $email,
+        '{{company_name}}' => $subscriber['company_name'] ?? '',
+        '{{phone}}' => $subscriber['phone_number'] ?? '',
+        '{{job_title}}' => $subscriber['job_title'] ?? '',
+        '{{year}}' => date('Y'),
+        '{{date}}' => date('d/m/Y')
+    ];
+
+    foreach ($context as $key => $val) {
+        if (is_string($val) || is_numeric($val)) {
+            $map["{{$key}}"] = $val;
+        }
+    }
+
+    return str_replace(array_keys($map), array_values($map), $html);
+}
+
+// =================================================================================
+// HELPER: Log Activity with Limit (Replicated for self-sufficiency)
+// =================================================================================
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    $count = $stmtCount->fetchColumn();
+
+    if ($count > 10) {
+        $stmtDel = $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1");
+        $stmtDel->execute([$subscriberId]);
+    }
+}
+
+
+// =================================================================================
+// CAMPAIGN DISPATCHER
+// =================================================================================
+$stmtCamp = $pdo->prepare("SELECT * FROM campaigns WHERE status IN ('scheduled', 'sending') AND (scheduled_at <= ? OR scheduled_at IS NULL) LIMIT 1");
+$stmtCamp->execute([$now]);
+$campaign = $stmtCamp->fetch();
+
+if ($campaign) {
+    $cid = $campaign['id'];
+    $cName = $campaign['name'];
+    
+    if ($campaign['status'] === 'scheduled') {
+        // Change status to 'sending' before starting to avoid other workers picking it up
+        $pdo->prepare("UPDATE campaigns SET status = 'sending', sent_at = NOW() WHERE id = ?")->execute([$cid]);
+        $logs[] = "[Campaign {$cid}] Started sending.";
+    }
+
+    // Resolve Content for Campaign once
+    $htmlContent = resolveEmailContent($pdo, $campaign['template_id'], '', $campaign['content_body']);
+
+    // 2. Identify Target Audience in batches
+    $sql = "SELECT DISTINCT s.id, s.email, s.first_name, s.last_name, s.phone_number, s.company_name, s.job_title 
+            FROM subscribers s WHERE s.status = 'active'";
+    $wheres = [];
+    $target = json_decode($campaign['target_config'], true);
+    
+    if (!empty($target['listIds'])) {
+        $ids = implode("','", $target['listIds']);
+        $wheres[] = "s.id IN (SELECT subscriber_id FROM subscriber_lists WHERE list_id IN ('$ids'))";
+    }
+    
+    if (!empty($target['tagIds'])) {
+        foreach ($target['tagIds'] as $tag) {
+            $wheres[] = "JSON_CONTAINS(s.tags, JSON_QUOTE(?))";
+        }
+    }
+    
+    if (!empty($wheres)) {
+        $sql .= " AND (" . implode(' OR ', $wheres) . ")";
+    }
+
+    // Exclude already sent for THIS campaign
+    $sql .= " AND s.id NOT IN (SELECT subscriber_id FROM subscriber_activity WHERE type='receive_email' AND reference_id = ?)";
+    
+    // LIMIT to process in batches
+    $BATCH_SIZE = 50; 
+    $sql .= " LIMIT {$BATCH_SIZE} FOR UPDATE"; // Use FOR UPDATE to lock selected rows
+
+    $stmtSubs = $pdo->prepare($sql);
+    
+    $execParams = [];
+    if (!empty($target['tagIds'])) {
+        foreach ($target['tagIds'] as $tag) {
+            $execParams[] = $tag;
+        }
+    }
+    $execParams[] = $cid;
+
+    $stmtSubs->execute($execParams);
+    $recipients = $stmtSubs->fetchAll();
+
+    if (count($recipients) > 0) {
+        $logs[] = "[Campaign {$cid}] Sending batch of " . count($recipients) . " emails.";
+        $sentCount = 0;
+        
+        foreach ($recipients as $sub) {
+            // Check personalized attachments
+            $attachments = [];
+            $campaignAttachments = json_decode($campaign['attachments'] ?? '[]', true);
+            if (!empty($campaignAttachments)) {
+                foreach ($campaignAttachments as $att) {
+                    if ($att['logic'] === 'all') {
+                        $attachments[] = ['path' => $att['path'], 'name' => $att['name']]; // Assuming 'path' is saved in DB (relative/absolute)
+                    } else if ($att['logic'] === 'match_email') {
+                        // Check if file name contains subscriber's email
+                        // Example: "invoice_alice@example.com.pdf" -> check for "alice@example.com" in filename
+                        if (strpos(strtolower($att['name']), strtolower($sub['email'])) !== false) {
+                            $attachments[] = ['path' => $att['path'], 'name' => $att['name']];
+                        }
+                    }
+                }
+            }
+            
+            $personalHtml = replaceMergeTags($htmlContent, $sub);
+            $personalSubject = replaceMergeTags($campaign['subject'], $sub);
+
+            // FIX: Truyền campaignId vào mailer->send để webhook có thể ghi đúng campaign_id
+            $res = $mailer->send($sub['email'], $personalSubject, $personalHtml, $sub['id'], $cid, null, null, $attachments);
+            
+            if ($res === true) {
+                $pdo->prepare("UPDATE subscribers SET stats_sent = stats_sent + 1 WHERE id = ?")->execute([$sub['id']]);
+                logActivity($pdo, $sub['id'], 'receive_email', $cid, $cName, "Campaign Sent", null, $cid); // FIX: Pass campaign_id
+                $sentCount++;
+            }
+        }
+        
+        $pdo->prepare("UPDATE campaigns SET count_sent = count_sent + ? WHERE id = ?")->execute([$sentCount, $cid]);
+        $logs[] = "[Campaign {$cid}] Sent {$sentCount} emails in this batch. Remaining to send.";
+    } else {
+        // No more recipients for this campaign, mark as sent
+        $pdo->prepare("UPDATE campaigns SET status = 'sent' WHERE id = ?")->execute([$cid]);
+        $logs[] = "[Campaign {$cid}] Finished sending.";
+    }
+} else {
+    $logs[] = "[Campaign] No campaigns ready to send.";
+}
+
+echo implode("\n", $logs);
+?>

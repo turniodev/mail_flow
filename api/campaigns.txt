@@ -1,0 +1,165 @@
+<?php
+require_once 'db_connect.php';
+apiHeaders();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = isset($_GET['id']) ? $_GET['id'] : null;
+
+// FIX: Cập nhật hàm logActivity để bao gồm flow_id và campaign_id
+function logActivity($pdo, $subscriberId, $type, $referenceId, $referenceName, $details, $flowId = null, $campaignId = null) {
+    $stmtIns = $pdo->prepare("INSERT INTO subscriber_activity (subscriber_id, type, reference_id, flow_id, campaign_id, reference_name, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())");
+    $stmtIns->execute([$subscriberId, $type, $referenceId, $flowId, $campaignId, $referenceName, $details]);
+    $stmtCount = $pdo->prepare("SELECT COUNT(id) FROM subscriber_activity WHERE subscriber_id = ?");
+    $stmtCount->execute([$subscriberId]);
+    if ($stmtCount->fetchColumn() > 10) {
+        $pdo->prepare("DELETE FROM subscriber_activity WHERE subscriber_id = ? ORDER BY created_at ASC LIMIT 1")->execute([$subscriberId]);
+    }
+}
+
+function formatCampaign($row) {
+    $row['target'] = json_decode($row['target_config'] ?? '{"listIds":[], "segmentIds":[], "individualIds":[]}');
+    // Map DB columns to stats object
+    $row['stats'] = [
+        'sent' => $row['count_sent'],
+        'opened' => $row['count_opened'],
+        'clicked' => $row['count_clicked'],
+        'bounced' => $row['count_bounced'],
+        'spam' => $row['count_spam']
+    ];
+    $row['reminders'] = []; // Fetched separately
+    $row['trackingEnabled'] = (bool)$row['tracking_enabled'];
+    $row['senderEmail'] = $row['sender_email'];
+    $row['templateId'] = $row['template_id'];
+    $row['contentBody'] = $row['content_body'];
+    $row['sentAt'] = $row['sent_at'];
+    $row['scheduledAt'] = $row['scheduled_at'];
+    $row['attachments'] = json_decode($row['attachments'] ?? '[]');
+    
+    // Clean up snake_case keys used for internal mapping
+    unset($row['target_config'], $row['count_sent'], $row['count_opened'], $row['count_clicked'], 
+          $row['count_bounced'], $row['count_spam'], $row['tracking_enabled'], 
+          $row['sender_email'], $row['template_id'], $row['content_body'], 
+          $row['sent_at'], $row['scheduled_at']);
+          
+    return $row;
+}
+
+switch ($method) {
+    case 'GET':
+        if ($path) {
+            $stmt = $pdo->prepare("SELECT * FROM campaigns WHERE id = ?");
+            $stmt->execute([$path]);
+            $camp = $stmt->fetch();
+            if ($camp) {
+                $data = formatCampaign($camp);
+                // Get reminders
+                $stmtRem = $pdo->prepare("SELECT * FROM campaign_reminders WHERE campaign_id = ?");
+                $stmtRem->execute([$path]);
+                $reminders = $stmtRem->fetchAll();
+                // Map snake_case reminders to camelCase
+                $data['reminders'] = array_map(function($r) {
+                    return [
+                        'id' => $r['id'],
+                        'type' => $r['type'],
+                        'triggerMode' => $r['trigger_mode'],
+                        'delayDays' => $r['delay_days'],
+                        'delayHours' => $r['delay_hours'],
+                        'scheduledAt' => $r['scheduled_at'],
+                        'subject' => $r['subject'],
+                        'templateId' => $r['template_id']
+                    ];
+                }, $reminders);
+                
+                jsonResponse(true, $data);
+            } else {
+                jsonResponse(false, null, 'Not found');
+            }
+        } else {
+            $stmt = $pdo->query("SELECT * FROM campaigns ORDER BY created_at DESC");
+            $camps = $stmt->fetchAll();
+            $data = array_map('formatCampaign', $camps);
+            jsonResponse(true, $data);
+        }
+        break;
+
+    case 'POST':
+        $data = json_decode(file_get_contents("php://input"), true);
+        $id = $data['id'] ?? uniqid();
+        
+        $sql = "INSERT INTO campaigns (id, name, subject, sender_email, status, template_id, content_body, target_config, tracking_enabled, scheduled_at, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
+        $stmt = $pdo->prepare($sql);
+        
+        $targetJson = json_encode($data['target']);
+        $attachmentsJson = json_encode($data['attachments'] ?? []);
+        $tracking = $data['trackingEnabled'] ? 1 : 0;
+        
+        $stmt->execute([
+            $id, $data['name'], $data['subject'], $data['senderEmail'], 
+            $data['status'], $data['templateId'], $data['contentBody'], 
+            $targetJson, $tracking, $data['scheduledAt'] ?? null, $attachmentsJson
+        ]);
+        
+        // Insert Reminders
+        if (!empty($data['reminders'])) {
+            $stmtRem = $pdo->prepare("INSERT INTO campaign_reminders (id, campaign_id, type, trigger_mode, delay_days, delay_hours, scheduled_at, subject, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            foreach ($data['reminders'] as $r) {
+                $stmtRem->execute([
+                    $r['id'] ?? uniqid(), $id, $r['type'], $r['triggerMode'], 
+                    $r['delayDays'], $r['delayHours'], $r['scheduledAt'] ?? null, 
+                    $r['subject'], $r['templateId']
+                ]);
+            }
+        }
+
+        $data['id'] = $id;
+        jsonResponse(true, $data);
+        break;
+
+    case 'PUT':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $data = json_decode(file_get_contents("php://input"), true);
+        
+        $targetJson = json_encode($data['target']);
+        $attachmentsJson = json_encode($data['attachments'] ?? []);
+        $tracking = $data['trackingEnabled'] ? 1 : 0;
+        
+        $sql = "UPDATE campaigns SET name=?, subject=?, sender_email=?, status=?, template_id=?, content_body=?, target_config=?, tracking_enabled=?, scheduled_at=?, sent_at=?, attachments=? WHERE id=?";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([
+            $data['name'], $data['subject'], $data['senderEmail'], 
+            $data['status'], $data['templateId'], $data['contentBody'], 
+            $targetJson, $tracking, $data['scheduledAt'] ?? null, $data['sentAt'] ?? null,
+            $attachmentsJson,
+            $path
+        ]);
+        
+        // Update Reminders (Full replacement for simplicity)
+        $pdo->prepare("DELETE FROM campaign_reminders WHERE campaign_id = ?")->execute([$path]);
+        if (!empty($data['reminders'])) {
+            $stmtRem = $pdo->prepare("INSERT INTO campaign_reminders (id, campaign_id, type, trigger_mode, delay_days, delay_hours, scheduled_at, subject, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            foreach ($data['reminders'] as $r) {
+                $stmtRem->execute([
+                    $r['id'] ?? uniqid(), $path, $r['type'], $r['triggerMode'], 
+                    $r['delayDays'], $r['delayHours'], $r['scheduledAt'] ?? null, 
+                    $r['subject'], $r['templateId']
+                ]);
+            }
+        }
+        
+        // If stats updated from frontend (simulation), update columns
+        if (isset($data['stats'])) {
+            $stats = $data['stats'];
+            $pdo->prepare("UPDATE campaigns SET count_sent=?, count_opened=?, count_clicked=?, count_bounced=?, count_spam=? WHERE id=?")
+                ->execute([$stats['sent'], $stats['opened'], $stats['clicked'], $stats['bounced'], $stats['spam'], $path]);
+        }
+
+        jsonResponse(true, $data);
+        break;
+
+    case 'DELETE':
+        if (!$path) jsonResponse(false, null, 'ID required');
+        $pdo->prepare("DELETE FROM campaigns WHERE id = ?")->execute([$path]);
+        jsonResponse(true, ['id' => $path]);
+        break;
+}
+?>
